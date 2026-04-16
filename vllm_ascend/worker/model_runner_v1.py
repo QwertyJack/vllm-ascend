@@ -49,7 +49,6 @@ from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
-from vllm.v1.attention.selector import get_attn_backend  # type: ignore
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.worker.utils import select_common_block_size
 from vllm.v1.kv_cache_interface import (
@@ -93,6 +92,7 @@ from vllm.v1.worker.utils import AttentionGroup
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, using_paged_attention
+from vllm_ascend.patch.platform.patch_selector import get_attn_backend
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -2047,11 +2047,10 @@ class NPUModelRunner(GPUModelRunner):
             return {}, None
         num_tokens_padded = num_tokens_padded or num_tokens
         num_reqs_padded = num_reqs_padded or num_reqs
-        
+
         # check
-        # attn_metadata: PerLayerAttnMetadata = {}
-        attn_metadata: dict[str, Any] = defaultdict(list)
-        
+        attn_metadata: PerLayerAttnMetadata = {}
+
         if ubatch_slices is not None:
             attn_metadata = [dict() for _ in range(len(ubatch_slices))]
         if for_cudagraph_capture:
@@ -2180,10 +2179,10 @@ class NPUModelRunner(GPUModelRunner):
             attn_gid: int,
             common_attn_metadata: CommonAttentionMetadata,
             num_reqs_actual: int,
-            prefill_ratio_to_sas_metadata: dict,
-            decode_ratio_to_sas_metadata: dict,
             ubid: int | None = None,
         ) -> None:
+            nonlocal prefill_ratio_to_sas_metadata
+            nonlocal decode_ratio_to_sas_metadata
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             cascade_attn_prefix_len = (
@@ -2227,8 +2226,9 @@ class NPUModelRunner(GPUModelRunner):
                     and isinstance(builder, GDNAttentionMetadataBuilder) and attn_metadata_i.num_prefills == 0:
                     if attn_metadata_i.num_decodes == 0 and attn_metadata_i.num_spec_decodes > 0:
                         attn_metadata_i.spec_state_indices_tensor[attn_metadata_i.num_spec_decodes:].fill_(0)
-            prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata
-            decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
+            if isinstance(builder, AscendDSAMetadataBuilder):
+                prefill_ratio_to_sas_metadata = builder.prefill_ratio_to_sas_metadata
+                decode_ratio_to_sas_metadata = builder.decode_ratio_to_sas_metadata
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -2238,7 +2238,7 @@ class NPUModelRunner(GPUModelRunner):
                 attn_metadata_dict = attn_metadata[ubid]
 
             for layer_name in attn_group.layer_names:
-                attn_metadata_dict[layer_name].append(attn_metadata_i)
+                attn_metadata_dict[layer_name] = attn_metadata_i
 
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
@@ -2276,7 +2276,12 @@ class NPUModelRunner(GPUModelRunner):
                     spec_decode_common_attn_metadata = cm
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
-                _build_attn_group_metadata(kv_cache_gid, attn_gid, cm, num_reqs_actual, prefill_ratio_to_sas_metadata, decode_ratio_to_sas_metadata)
+                _build_attn_group_metadata(
+                    kv_cache_gid,
+                    attn_gid,
+                    cm,
+                    num_reqs_actual,
+                )
         if self.is_mm_prefix_lm:
             req_doc_ranges = {}
             for req_id in self.input_batch.req_ids:
@@ -3032,8 +3037,19 @@ class NPUModelRunner(GPUModelRunner):
 
                     if hasattr(attn_backend, "get_supported_kernel_block_sizes") and self.use_hybrid_blocks:
                         block_size = attn_backend.get_supported_kernel_block_sizes()[0]
-
+                        if group.kv_cache_group_id < len(self.kernel_block_sizes):
+                            kernel_block_size = self.kernel_block_sizes[group.kv_cache_group_id]
+                            if isinstance(kernel_block_size, list):
+                                if kernel_block_size:
+                                    block_size = int(kernel_block_size[0])
+                            else:
+                                block_size = int(kernel_block_size)
                         block_size_chunk = current_kv_cache_spec.block_size // block_size
+                        assert block_size_chunk > 0, (
+                            "Selected kernel block size must not exceed the KV cache "
+                            f"block size: selected={block_size}, "
+                            f"kv_cache={current_kv_cache_spec.block_size}"
+                        )
                         kv_cache_shape = attn_backend.get_kv_cache_shape(
                             num_blocks * block_size_chunk,
                             block_size,
@@ -3183,20 +3199,23 @@ class NPUModelRunner(GPUModelRunner):
             if isinstance(kv_cache_spec, EncoderOnlyAttentionSpec):
                 continue
             elif isinstance(kv_cache_spec, AttentionSpec):
-                # This is an attention backend that supports virtual
-                # block splitting. Get the supported block sizes from
-                # the backend.
-                
-                # This is an attention backend that supports virtual
-                # block splitting. Get the supported block sizes from
-                # all backends in the group.
                 attn_groups = self.attn_groups[kv_cache_group_id]
                 kv_manager_block_size = kv_cache_group.kv_cache_spec.block_size
-                selected_kernel_size = select_common_block_size(
-                    kv_manager_block_size, [attn_group.backend for attn_group in attn_groups]
-                )
+                try:
+                    selected_kernel_size = select_common_block_size(
+                        kv_manager_block_size,
+                        [attn_group.backend for attn_group in attn_groups],
+                    )
+                except ValueError:
+                    # Hybrid groups may be configured with a smaller per-group
+                    # block size than the backend's default advertised kernel size.
+                    default_kernel_block_size = attn_groups[0].backend.get_supported_kernel_block_sizes()[0]
+                    if kv_manager_block_size < default_kernel_block_size:
+                        selected_kernel_size = kv_manager_block_size
+                    else:
+                        raise
                 self.kernel_block_sizes.append([selected_kernel_size])
-                
+
                 # try:
                 #     attn_groups = self.attn_groups[kv_cache_group_id]
                 # except IndexError:
