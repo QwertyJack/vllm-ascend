@@ -32,6 +32,7 @@ def _ensure_global_patch():
     from vllm_ascend.utils import adapt_patch
 
     adapt_patch(is_global_patch=True)
+    register_model()
     _GLOBAL_PATCH_APPLIED = True
 
 
@@ -66,6 +67,8 @@ def register_service_profiling():
 
     generate_service_profiling_config()
 
+
 def register_model():
     from .models import register_model
+
     register_model()

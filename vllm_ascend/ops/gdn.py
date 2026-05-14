@@ -66,6 +66,10 @@ def get_non_spec_chunked_prefill_meta(attn_metadata):
 
 
 class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
+    def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
+        conv_state_dtype, _ = super().get_state_dtype()
+        return conv_state_dtype, torch.bfloat16
+
     def forward(
         self,
         hidden_states: torch.Tensor,

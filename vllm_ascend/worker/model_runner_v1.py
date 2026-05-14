@@ -3936,6 +3936,7 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec_list[layer_name] = spec
             elif isinstance(attn_module, Attention):
+                if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     kv_cache_spec_list[layer_name] = spec
                     attn_layer_names.add(layer_name)
 
