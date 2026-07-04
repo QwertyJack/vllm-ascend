@@ -1247,6 +1247,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        metadata_kwargs.setdefault("device", str(self.seqused_q.device))
         ori_win_left, ori_win_right = get_draft_swa_window(
             self.vllm_config,
             common_attn_metadata,
@@ -1350,6 +1351,7 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
 
         metadata_op = DeviceOperator.get_dsa_sparse_attn_metadata_op()
         metadata_kwargs = DeviceOperator.get_dsa_sparse_attn_metadata_kwargs(self.seqused_q.device)
+        metadata_kwargs.setdefault("device", str(self.seqused_q.device))
         ori_win_left, ori_win_right = get_draft_swa_window(
             self.vllm_config,
             common_attn_metadata,
@@ -1359,39 +1361,64 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
                 self.vllm_config,
                 common_attn_metadata,
             )
-        cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
-            None,
-            "draft_cu_seqlens_ori_kv",
-            seq_lens,
-            num_decodes_typed,
-            self._zero_i32,
-            self.cu_seqlens_ori_kv,
-        )
-        cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
+        if dspark_swa_indices is not None:
+            decode_sas_metadata = metadata_op(
+                **metadata_kwargs,
+                num_heads_q=n_local_heads,
+                num_heads_kv=1,
+                head_dim=self.model_config.get_head_size(),
+                cu_seqlens_q=query_start_loc,
+                cu_seqlens_ori_kv=None,
+                cu_seqlens_cmp_kv=None,
+                seqused_q=None,
+                seqused_kv=seq_lens[:num_decodes],
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=len(seq_lens[:num_decodes]),
+                cmp_ratio=1,
+                ori_mask_mode=4,
+                cmp_mask_mode=3,
+                ori_win_left=ori_win_left,
+                ori_win_right=ori_win_right,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                has_ori_kv=True,
+                has_cmp_kv=False,
+            )
+        else:
+            cu_seqlens_ori_kv = DeviceOperator.get_dsa_decode_cu_seqlens_ori_kv(
+                None,
+                "draft_cu_seqlens_ori_kv",
+                seq_lens,
+                num_decodes_typed,
+                self._zero_i32,
+                self.cu_seqlens_ori_kv,
+            )
+            cu_seqlens_cmp_kv = DeviceOperator.get_dsa_decode_cu_seqlens_cmp_kv(self.cu_seqlens_cmp_kv)
 
-        decode_sas_metadata = metadata_op(
-            **metadata_kwargs,
-            num_heads_q=n_local_heads,
-            num_heads_kv=1,
-            head_dim=self.model_config.get_head_size(),
-            cu_seqlens_q=query_start_loc,
-            cu_seqlens_ori_kv=cu_seqlens_ori_kv,
-            cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
-            seqused_q=self.seqused_q,
-            seqused_kv=seq_lens[:num_decodes],
-            max_seqlen_q=max_seqlen_q,
-            max_seqlen_kv=max_seqlen_kv,
-            batch_size=len(seq_lens[:num_decodes]),
-            cmp_ratio=1,
-            ori_mask_mode=4,
-            cmp_mask_mode=3,
-            ori_win_left=ori_win_left,
-            ori_win_right=ori_win_right,
-            layout_q="TND",
-            layout_kv="PA_ND",
-            has_ori_kv=True,
-            has_cmp_kv=False,
-        )
+            decode_sas_metadata = metadata_op(
+                **metadata_kwargs,
+                num_heads_q=n_local_heads,
+                num_heads_kv=1,
+                head_dim=self.model_config.get_head_size(),
+                cu_seqlens_q=query_start_loc,
+                cu_seqlens_ori_kv=cu_seqlens_ori_kv,
+                cu_seqlens_cmp_kv=cu_seqlens_cmp_kv,
+                seqused_q=self.seqused_q,
+                seqused_kv=seq_lens[:num_decodes],
+                max_seqlen_q=max_seqlen_q,
+                max_seqlen_kv=max_seqlen_kv,
+                batch_size=len(seq_lens[:num_decodes]),
+                cmp_ratio=1,
+                ori_mask_mode=4,
+                cmp_mask_mode=3,
+                ori_win_left=ori_win_left,
+                ori_win_right=ori_win_right,
+                layout_q="TND",
+                layout_kv="PA_ND",
+                has_ori_kv=True,
+                has_cmp_kv=False,
+            )
 
         decode_metadata = AscendDSADecodeMetadata(
             input_positions=None,
@@ -1457,6 +1484,19 @@ class AscendDSAImpl(DSAAttentionImpl):
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
     """
+
+    @staticmethod
+    def update_graph_params(
+        update_stream,
+        forward_context,
+        num_tokens,
+        vllm_config=None,
+        speculative_config=None,
+        num_dcp_pcp_tokens=None,
+        draft_attn_metadatas=None,
+    ):
+        # DSA replay does not register per-attention graph params.
+        pass
 
     def __init__(
         self,
