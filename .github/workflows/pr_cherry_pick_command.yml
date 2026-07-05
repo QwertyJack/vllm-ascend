@@ -198,13 +198,16 @@ jobs:
           # Push the new branch to the PAT_TOKEN user's fork
           git push -f fork "$CHERRY_BRANCH"
 
-          # Check if a cherry-pick PR already exists for this target branch
+          # Check if a cherry-pick PR already exists for this target branch.
+          # gh pr list --head requires "owner:branch" format for fork branches,
+          # but it can be unreliable. We also add `2>/dev/null || true` to ensure
+          # the step doesn't fail even if the query returns nothing.
           EXISTING_PR_URL=$(gh pr list \
             --repo "$REPO" \
             --head "${TOKEN_USER}:${CHERRY_BRANCH}" \
             --base "$TARGET_BRANCH" \
             --state open \
-            --json url --jq '.[0].url // empty')
+            --json url --jq '.[0].url // empty' 2>/dev/null || true)
 
           if [ -n "$EXISTING_PR_URL" ]; then
             # PR already exists — branch has been force-pushed, just notify
@@ -212,19 +215,37 @@ jobs:
             echo "cherry_status=refreshed" >> "$GITHUB_OUTPUT"
             echo "existing_pr_url=$EXISTING_PR_URL" >> "$GITHUB_OUTPUT"
           else
-            # Create a new PR from the fork branch
+            # Create a new PR from the fork branch.
+            # If the PR already exists (gh pr list missed it), gh pr create will
+            # fail — we parse the error to extract the existing PR URL instead of
+            # letting the step crash.
             NEW_PR_TITLE="[Cherry-pick][${TARGET_BRANCH}]${PR_TITLE} (from #${PR_NUMBER})"
             NEW_PR_BODY="Cherry-pick of PR #${PR_NUMBER} onto \`${TARGET_BRANCH}\`."$'\n'$'\n'"Original PR: #${PR_NUMBER}"$'\n'"Original author: @${PR_AUTHOR}"$'\n'$'\n'"---"$'\n'"${PR_BODY}"
 
-            NEW_PR_URL=$(gh pr create \
+            CREATE_LOG=/tmp/gh_pr_create.log
+            if NEW_PR_URL=$(gh pr create \
               --repo "$REPO" \
               --title "$NEW_PR_TITLE" \
               --body "$NEW_PR_BODY" \
               --base "$TARGET_BRANCH" \
-              --head "${TOKEN_USER}:${CHERRY_BRANCH}")
-
-            echo "new_pr_url=$NEW_PR_URL" >> "$GITHUB_OUTPUT"
-            echo "cherry_status=success" >> "$GITHUB_OUTPUT"
+              --head "${TOKEN_USER}:${CHERRY_BRANCH}" 2>"$CREATE_LOG"); then
+              echo "new_pr_url=$NEW_PR_URL" >> "$GITHUB_OUTPUT"
+              echo "cherry_status=success" >> "$GITHUB_OUTPUT"
+            else
+              # If PR already exists, gh pr create fails with "already exists"
+              # and includes the existing PR URL in the message.
+              EXISTING_PR_URL=$(grep -oE 'https://github.com/[^ ]+/pull/[0-9]+' "$CREATE_LOG" | head -1 || true)
+              if [ -n "$EXISTING_PR_URL" ]; then
+                echo "Cherry-pick PR already exists: $EXISTING_PR_URL"
+                echo "cherry_status=refreshed" >> "$GITHUB_OUTPUT"
+                echo "existing_pr_url=$EXISTING_PR_URL" >> "$GITHUB_OUTPUT"
+              else
+                echo "::error::Failed to create PR:"
+                cat "$CREATE_LOG"
+                echo "cherry_status=create_failed" >> "$GITHUB_OUTPUT"
+                exit 1
+              fi
+            fi
           fi
 
       - name: Comment success result
