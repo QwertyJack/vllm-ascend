@@ -1221,6 +1221,9 @@ class AscendDSAMetadataBuilder(AttentionMetadataBuilder[AscendDSAMetadata]):
         reqs_start = kwargs.get("reqs_start")
         tokens_start = kwargs.get("tokens_start")
         num_prefill_tokens = kwargs.get("num_prefill_tokens")
+        assert reqs_start is not None
+        assert tokens_start is not None
+        assert num_prefill_tokens is not None
         query_start_loc = common_attn_metadata.query_start_loc
         prefill_query_start_loc = query_start_loc[reqs_start:] - query_start_loc[reqs_start]
         seq_lens_q = prefill_query_start_loc[1:] - prefill_query_start_loc[:-1]
@@ -1489,19 +1492,6 @@ class AscendDSAImpl(DSAAttentionImpl):
     NOTE: Please read the comment at the top of the file before trying to
     understand this class
     """
-
-    @staticmethod
-    def update_graph_params(
-        update_stream,
-        forward_context,
-        num_tokens,
-        vllm_config=None,
-        speculative_config=None,
-        num_dcp_pcp_tokens=None,
-        draft_attn_metadatas=None,
-    ):
-        # DSA replay does not register per-attention graph params.
-        pass
 
     def __init__(
         self,
