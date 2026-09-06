@@ -13,12 +13,14 @@ from vllm.distributed import get_pp_group
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
+    gather_cache_rows,
     scatter_cache,
     small_op_attention,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
+    DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
     validate_cache_runtime,
 )
@@ -216,16 +218,18 @@ def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
             dtype=torch.bfloat16,
             compress_ratio=role.compress_ratio,
         )
-        specs[f"{attn_prefix}.indexer.k_cache"] = DeepseekV41FullSpec(
+        specs[f"{attn_prefix}.indexer.k_cache"] = DeepseekV41IndexerSpec(
             block_size=block_size,
             num_kv_heads=1,
             head_size=index_width,
-            dtype=torch.bfloat16,
+            dtype=torch.int8,
             compress_ratio=role.compress_ratio,
+            scale_dim=1,
+            scale_dtype=torch.float16,
         )
         if role.compress_ratio == 2:
             specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(
-                block_size=block_size,
+                block_size=16,
                 num_kv_heads=1,
                 head_size=2 * width,
                 dtype=torch.float32,
@@ -414,10 +418,8 @@ class DeepseekV41Attention(DeepseekV4Attention):
             )
             completed = positions.remainder(ratio) == ratio - 1
             completed_slots = state_meta.slot_mapping[: positions.shape[0]][completed].long()
-            current = state_cache.view(-1, state_cache.shape[-1]).index_select(0, completed_slots)
-            previous = state_cache.view(-1, state_cache.shape[-1]).index_select(
-                0, completed_slots - 1
-            )
+            current = gather_cache_rows(state_cache, completed_slots)
+            previous = gather_cache_rows(state_cache, completed_slots - 1)
             pair = torch.stack((previous, current), 1)
             latent = (
                 pair[..., : self.head_dim]

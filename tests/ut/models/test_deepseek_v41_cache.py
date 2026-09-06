@@ -10,13 +10,17 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
+    gather_cache_rows,
+    scatter_cache,
     select_candidate_blocks,
     select_index_topk,
 )
 from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41IndexerSpec,
     allocate_cache_config,
     group_cache_specs,
     make_cache_groups,
+    pool_bytes_per_block,
     reshape_cache,
 )
 from vllm_ascend.models.deepseek_v41.compressor import DeepseekV41Compressor
@@ -94,24 +98,90 @@ def test_invalid_block_sizes(config, runtime, block_size):
         build_v41_cache_specs(config, runtime)
 
 
-def test_four_groups_and_exact_physical_accounting(config, runtime):
+def test_seventeen_groups_and_packed_physical_accounting(config, runtime):
     specs = collect_specs(runtime)
     uniform = group_cache_specs(specs)
-    assert [len(g.kv_cache_specs) for g in uniform] == [40, 6, 2, 3]
-    assert [g.block_size for g in uniform] == [64] * 4
-    bytes_per_block = sum(s.page_size_bytes for s in specs.values())
-    blocks, tensors = allocate_cache_config(runtime, make_cache_groups(uniform), bytes_per_block * 10 + 1)
+    assert [len(g.kv_cache_specs) for g in uniform[:3]] == [6, 2, 3]
+    assert [len(g.kv_cache_specs) for g in uniform[3:]] == [3] * 12 + [2] * 2
+    assert [g.block_size for g in uniform[:2]] == [64, 64]
+    assert uniform[2].block_size == 16
+    assert [g.block_size for g in uniform[3:]] == [64] * 14
+    groups = make_cache_groups(uniform)
+    block_stride = pool_bytes_per_block(groups)
+    blocks, tensors = allocate_cache_config(runtime, groups, block_stride * 10 + 1)
     assert blocks == 10
-    assert len(tensors) == 51
-    assert sum(t.size for t in tensors) == 10 * bytes_per_block
-    assert len({t.shared_by[0] for t in tensors}) == 51
-    assert all(len(t.shared_by) == 1 for t in tensors)
+    assert all(t.size == 10 * block_stride for t in tensors)
+    assert all(t.block_stride == block_stride for t in tensors)
+    assert {name for tensor in tensors for name in tensor.shared_by} == set(specs)
+
+    raw = torch.zeros(blocks * block_stride, dtype=torch.uint8)
     for allocation in tensors:
-        spec = specs[allocation.shared_by[0]]
-        raw = torch.zeros(allocation.size, dtype=torch.uint8)
-        cache = reshape_cache(raw, spec)
-        assert cache.shape == (blocks, spec.storage_block_size, 1, spec.head_size)
-        assert cache.data_ptr() == raw.data_ptr()
+        for name in allocation.shared_by:
+            spec = specs[name]
+            cache = reshape_cache(
+                raw,
+                spec,
+                blocks,
+                allocation.offset,
+                allocation.block_stride,
+            )
+            views = cache if isinstance(cache, tuple) else (cache,)
+            assert views[0].shape == (
+                blocks,
+                spec.storage_block_size,
+                1,
+                spec.head_size,
+            )
+            assert views[0].data_ptr() == raw.data_ptr() + allocation.offset
+            assert views[0].stride(0) * views[0].element_size() == block_stride
+            if isinstance(spec, DeepseekV41IndexerSpec):
+                k, scale = cache
+                assert k.dtype == torch.int8
+                assert scale.dtype == torch.float16
+                k_bytes = spec.storage_block_size * spec.head_size
+                assert scale.data_ptr() == k.data_ptr() + k_bytes
+                assert scale.stride(0) * scale.element_size() == block_stride
+
+
+def test_production_layout_matches_design(config, runtime):
+    production = dict(config, head_dim=512, index_head_dim=128)
+    runtime.cache_config.block_size = 128
+    specs = build_v41_cache_specs(production, runtime)
+    groups = make_cache_groups(group_cache_specs(specs))
+    assert len(groups) == 17
+    assert [g.kv_cache_spec.page_size_bytes for g in groups[:3]] == [221568, 147712, 196608]
+    assert [g.kv_cache_spec.page_size_bytes for g in groups[3:]] == [393216] * 12 + [262144] * 2
+    assert pool_bytes_per_block(groups) == 393216
+
+
+def test_packed_strided_views_support_row_io_without_cross_resource_corruption(config, runtime):
+    specs = collect_specs(runtime)
+    groups = make_cache_groups(group_cache_specs(specs))
+    stride = pool_bytes_per_block(groups)
+    blocks, tensors = allocate_cache_config(runtime, groups, stride * 4)
+    descriptors = {
+        name: tensor
+        for tensor in tensors
+        for name in tensor.shared_by
+    }
+    long_name = "model.layers.2.self_attn.long_kv_cache"
+    index_name = "model.layers.2.self_attn.indexer.k_cache"
+    raw = torch.zeros(blocks * stride, dtype=torch.uint8)
+    long_desc = descriptors[long_name]
+    index_desc = descriptors[index_name]
+    long_cache = reshape_cache(
+        raw, specs[long_name], blocks, long_desc.offset, long_desc.block_stride
+    )
+    index_k, index_scale = reshape_cache(
+        raw, specs[index_name], blocks, index_desc.offset, index_desc.block_stride
+    )
+
+    slots = torch.tensor([1 * specs[long_name].storage_block_size + 3])
+    value = torch.arange(config["head_dim"], dtype=torch.bfloat16).unsqueeze(0)
+    scatter_cache(long_cache, slots, value)
+    torch.testing.assert_close(gather_cache_rows(long_cache, slots), value)
+    assert not index_k.any()
+    assert not index_scale.any()
 
 
 def test_mixed_layouts_rejected(config, runtime):
@@ -139,7 +209,7 @@ def test_model_registration_and_binding(runtime):
     state = context["language_model.model.layers.2.self_attn.compressor.state_cache"]
     assert state is context["language_model.model.layers.2.self_attn.compressor.state_cache"]
     assert state.spec.sliding_window == 2
-    assert state.spec.storage_block_size == 64
+    assert state.spec.storage_block_size == 16
     owned_names = [name for name, module in modules.named_modules() if hasattr(module, "kv_cache")]
     assert len(owned_names) == 51
 
@@ -193,18 +263,18 @@ def test_state_metadata_keeps_original_token_slots(config, runtime):
     specs = collect_specs(runtime)
     spec = specs["model.layers.2.self_attn.compressor.state_cache"]
     builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
-    slots = torch.tensor([7 * 64 + 63, 3 * 64, -1])
+    slots = torch.tensor([7 * 16 + 15, 3 * 16, -1])
     common = SimpleNamespace(
         slot_mapping=slots,
         block_table_tensor=torch.tensor([[7, 3]]),
         query_start_loc=torch.tensor([0, 2]),
-        seq_lens=torch.tensor([65]),
+        seq_lens=torch.tensor([17]),
     )
     metadata = builder.build(0, common)
     assert metadata.is_compressor_state
     assert metadata.slot_mapping is slots
     assert metadata.compress_ratio == 1
-    assert metadata.storage_block_size == 64
+    assert metadata.storage_block_size == 16
 
 
 def test_actual_attention_parameter_ownership(config, runtime):
@@ -248,9 +318,9 @@ def test_state_uses_swa_memory_and_block_table_rules(config, runtime):
     assert isinstance(spec, DeepseekV41CompressorStateSpec)
     assert spec.sliding_window == 2
     assert spec.compress_ratio == 1
-    assert spec.storage_block_size == 64
-    assert spec.page_size_bytes == 64 * 16 * 4
-    assert spec.max_num_blocks_per_req(runtime, 1024) == 16
+    assert spec.storage_block_size == 16
+    assert spec.page_size_bytes == 16 * 16 * 4
+    assert spec.max_num_blocks_per_req(runtime, 1024) == 64
     runtime.max_in_flight_tokens = 128
     runtime.model_config.max_model_len = 1024
     expected_pages = spec.max_admission_blocks_per_request(128, 1024)

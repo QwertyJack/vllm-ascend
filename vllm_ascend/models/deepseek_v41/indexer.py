@@ -13,7 +13,7 @@ from vllm_ascend.attention.dsa_v41 import (
     select_candidate_blocks,
     select_index_topk,
 )
-from vllm_ascend.core.deepseek_v41 import DeepseekV41FullSpec
+from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
 
 from .compressor import DeepseekV41RMSNorm, _read
 
@@ -71,12 +71,14 @@ class DeepseekV41Indexer(nn.Module):
             self.k_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.k_cache",
-                DeepseekV41FullSpec(
+                DeepseekV41IndexerSpec(
                     block_size=vllm_config.cache_config.block_size,
                     num_kv_heads=1,
                     head_size=self.width,
-                    dtype=torch.bfloat16,
+                    dtype=torch.int8,
                     compress_ratio=compress_ratio,
+                    scale_dim=1,
+                    scale_dtype=torch.float16,
                 ),
             )
 
@@ -97,11 +99,12 @@ class DeepseekV41Indexer(nn.Module):
             rotary_mode="interleave",
             partial_slice=[self.width - self.rope_width, self.width],
         )
-        scatter_cache(
-            self.k_cache.kv_cache[0],
-            slots,
-            key.squeeze(1),
-        )
+        key = key.squeeze(1)
+        scale = key.float().abs().amax(-1, keepdim=True).clamp_min_(1e-12) / 127.0
+        quantized = (key.float() / scale).round_().clamp_(-127, 127).to(torch.int8)
+        k_cache, scale_cache = self.k_cache.kv_cache[0]
+        scatter_cache(k_cache, slots, quantized)
+        scatter_cache(scale_cache, slots, scale.to(torch.float16))
 
     def select(
         self,
@@ -157,12 +160,20 @@ class DeepseekV41Indexer(nn.Module):
                     )
                 continue
 
+            k_cache, scale_cache = source_cache
             key = paged_prefix(
-                source_cache,
+                k_cache,
                 source_metadata.block_table[req_idx],
                 compressed_len,
                 source_metadata.storage_block_size,
             )
+            key_scale = paged_prefix(
+                scale_cache,
+                source_metadata.block_table[req_idx],
+                compressed_len,
+                source_metadata.storage_block_size,
+            )
+            key = key.float() * key_scale.float()
             score = torch.einsum(
                 "qhd,kd->qhk",
                 query[q_start:q_end].float(),

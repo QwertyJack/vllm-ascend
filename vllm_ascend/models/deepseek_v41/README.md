@@ -23,16 +23,23 @@ the initial eager milestone.
 
 ## Hybrid cache layout
 
-All resource planes use one global block-ID lifecycle but have independent
-physical tensors and exact byte accounting:
+All resource planes use one global block-ID lifecycle and one packed uint8
+backing. Typed views use a common physical block stride plus a resource offset:
 
 - one BF16 sliding-window-128 KV plane for every backbone attention layer;
-- ratio2 compressed long-KV and Index-K planes owned by source layers 2, 8 and
-  14, shared by consumers 2-7, 8-13 and 14-19 respectively;
-- ratio1 long-KV and Index-K planes owned by source layer 20 and shared by
-  consumers 20-39;
-- one FP32 window-2 KV/score state plane at each ratio2 source. It stores one
-  uncompressed row per original token and emits one compressed latent per pair.
+- ratio2 BF16 long-KV and INT8+FP16-scale Index-K planes owned by source layers
+  2, 8 and 14, shared by consumers 2-7, 8-13 and 14-19 respectively;
+- ratio1 BF16 long-KV and INT8+FP16-scale Index-K planes owned by source layer
+  20 and shared by consumers 20-39;
+- one FP32 block-16, window-2 KV/score state plane at each ratio2 source. It
+  stores one uncompressed row per original token and emits one compressed
+  latent per pair.
+
+The scheduler forms 17 groups: ratio2 Long+Index, ratio1 Long+Index, State,
+then twelve 3-layer and two 2-layer SWA groups. At production dimensions every
+descriptor aliases one backing with a 393216-byte block stride. Resources in a
+group occupy disjoint offsets; different groups reuse offsets because a
+physical block ID is owned by exactly one scheduler group at a time.
 
 Index source layers 24, 28, 32 and 36 compute new selections in the reference
 architecture but do not own another copy of the long KV or Index K. Candidate

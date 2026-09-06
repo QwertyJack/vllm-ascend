@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Framework-side V4.1 cache specs, hybrid groups and physical allocation."""
+"""Framework-side V4.1 cache specs and packed hybrid allocation."""
 
+from collections import defaultdict
 from dataclasses import dataclass
-from enum import Enum
 
 import torch
 from vllm.v1.core.kv_cache_utils import may_override_num_blocks
@@ -12,18 +12,27 @@ from vllm.v1.kv_cache_interface import KVCacheGroupSpec, KVCacheTensor, UniformT
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSlidingWindowMLASpec
 
 
-class CacheGroup(str, Enum):
-    SWA = "swa"
-    COMPRESSED = "full_ratio2"
-    FULL = "full_ratio1"
-    STATE = "compressor_state"
-
-
 @dataclass(frozen=True, kw_only=True)
 class DeepseekV41FullSpec(AscendMLAAttentionSpec):
     def is_uniform_with_collection(self, specs):
         return all(
-            isinstance(s, DeepseekV41FullSpec) and s.compress_ratio == self.compress_ratio for s in specs.values()
+            isinstance(s, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))
+            and s.block_size == self.block_size
+            and s.compress_ratio == self.compress_ratio
+            for s in specs.values()
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
+class DeepseekV41IndexerSpec(AscendMLAAttentionSpec):
+    """Packed INT8 index key followed by one FP16 scale per stored row."""
+
+    def is_uniform_with_collection(self, specs):
+        return all(
+            isinstance(s, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))
+            and s.block_size == self.block_size
+            and s.compress_ratio == self.compress_ratio
+            for s in specs.values()
         )
 
 
@@ -51,35 +60,66 @@ class DeepseekV41CompressorStateSpec(AscendSlidingWindowMLASpec):
 
 
 def is_v41_spec(spec):
-    return isinstance(spec, (DeepseekV41FullSpec, DeepseekV41SWASpec, DeepseekV41CompressorStateSpec))
+    return isinstance(
+        spec,
+        (
+            DeepseekV41FullSpec,
+            DeepseekV41IndexerSpec,
+            DeepseekV41SWASpec,
+            DeepseekV41CompressorStateSpec,
+        ),
+    )
 
 
-def group_key(spec):
-    if isinstance(spec, DeepseekV41SWASpec):
-        return CacheGroup.SWA
-    if isinstance(spec, DeepseekV41CompressorStateSpec):
-        return CacheGroup.STATE
-    if isinstance(spec, DeepseekV41FullSpec):
-        return CacheGroup.COMPRESSED if spec.compress_ratio == 2 else CacheGroup.FULL
-    raise TypeError(f"Not a V4.1 cache spec: {type(spec)}")
+def _uniform(members, label):
+    if not members:
+        raise ValueError(f"V4.1 cache group {label} is empty")
+    uniform = UniformTypeKVCacheSpecs.from_specs(members)
+    if uniform is None:
+        raise ValueError(f"Incompatible V4.1 resource layouts in {label}")
+    return uniform
 
 
 def group_cache_specs(specs):
-    """Return None for other models, fail closed on mixed unsupported resources."""
+    """Build the fixed V4.1 ownership graph used by the hybrid manager."""
     if not any(is_v41_spec(s) for s in specs.values()):
         return None
     if not all(is_v41_spec(s) for s in specs.values()):
         raise ValueError("V4.1 mixed draft/foreign cache resources are not supported yet")
-    result = []
-    for key in CacheGroup:
-        members = {name: spec for name, spec in specs.items() if group_key(spec) == key}
-        if not members:
-            continue
-        uniform = UniformTypeKVCacheSpecs.from_specs(members)
-        if uniform is None:
-            raise ValueError(f"Incompatible V4.1 resource layouts in {key.value}")
-        result.append(uniform)
-    return result
+
+    ratio_groups = {}
+    for ratio in (2, 1):
+        members = {
+            name: spec
+            for name, spec in specs.items()
+            if isinstance(spec, (DeepseekV41FullSpec, DeepseekV41IndexerSpec))
+            and spec.compress_ratio == ratio
+        }
+        ratio_groups[ratio] = _uniform(members, f"ratio{ratio}")
+
+    state = {
+        name: spec
+        for name, spec in specs.items()
+        if isinstance(spec, DeepseekV41CompressorStateSpec)
+    }
+    groups = [ratio_groups[2], ratio_groups[1], _uniform(state, "state")]
+
+    swa = [
+        (name, spec)
+        for name, spec in specs.items()
+        if isinstance(spec, DeepseekV41SWASpec)
+    ]
+    if len(swa) != 40:
+        raise ValueError(f"V4.1 requires exactly 40 SWA resources, got {len(swa)}")
+    swa_groups = [swa[start : start + 3] for start in range(0, 36, 3)]
+    swa_groups.extend((swa[36:38], swa[38:40]))
+    groups.extend(
+        _uniform(dict(members), f"swa{group_idx}")
+        for group_idx, members in enumerate(swa_groups)
+    )
+    if len(groups) != 17:
+        raise AssertionError(f"V4.1 must form 17 cache groups, got {len(groups)}")
+    return groups
 
 
 def make_cache_groups(grouped_specs):
@@ -96,7 +136,7 @@ def has_v41_groups(groups):
 
 
 def pool_bytes_per_block(groups):
-    return sum(g.kv_cache_spec.page_size_bytes for g in groups)
+    return max(g.kv_cache_spec.page_size_bytes for g in groups)
 
 
 def request_blocks(vllm_config, groups):
@@ -111,33 +151,84 @@ def request_blocks(vllm_config, groups):
 
 
 def allocate_cache_config(vllm_config, groups, available_memory):
-    """One independent backing tensor per owner; no cross-group pool aliasing.
-
-    UniformType groups can contain different-sized resource planes. All groups
-    share the global block ID space, but each plane accounts for its own bytes.
-    Thus no common-page padding is necessary for this deliberately conservative
-    non-packed allocator. Physical block b has a separate location in each plane.
-    """
-    specs = {name: spec for g in groups for name, spec in g.kv_cache_spec.kv_cache_specs.items()}
-    bytes_per_block = sum(s.page_size_bytes for s in specs.values())
-    capacity = available_memory // bytes_per_block
+    """Allocate one block-strided backing shared by all scheduler groups."""
+    block_stride = pool_bytes_per_block(groups)
+    capacity = available_memory // block_stride
     num_blocks = may_override_num_blocks(vllm_config, capacity)
     if num_blocks <= 1 or num_blocks > capacity:
         raise ValueError("Insufficient V4.1 cache memory (including reserved null block), or unsafe block override")
-    return num_blocks, [
-        KVCacheTensor(size=s.page_size_bytes * num_blocks, shared_by=[name]) for name, s in specs.items()
+
+    layers_by_offset = defaultdict(list)
+    for group in groups:
+        offset = 0
+        for name in group.layer_names:
+            spec = group.kv_cache_spec.kv_cache_specs[name]
+            if offset + spec.page_size_bytes > block_stride:
+                raise AssertionError(f"V4.1 resource {name} exceeds packed block stride")
+            layers_by_offset[offset].append(name)
+            offset += spec.page_size_bytes
+
+    total_size = num_blocks * block_stride
+    tensors = [
+        KVCacheTensor(
+            size=total_size,
+            shared_by=layers_by_offset[offset],
+            offset=offset,
+            block_stride=block_stride,
+        )
+        for offset in sorted(layers_by_offset)
     ]
+    return num_blocks, tensors
 
 
-def reshape_cache(raw: torch.Tensor, spec):
-    if raw.numel() % spec.page_size_bytes:
-        raise ValueError("V4.1 cache allocation is not a whole number of pages")
-    num_blocks = raw.numel() // spec.page_size_bytes
-    # Explicit page stride also handles allocator padding without flatten-copy.
-    elements_per_page = spec.page_size_bytes // torch.empty((), dtype=spec.dtype).element_size()
-    view = raw.view(spec.dtype).view(num_blocks, elements_per_page)
-    elements = spec.storage_block_size * spec.num_kv_heads * spec.head_size
-    return view[:, :elements].view(num_blocks, spec.storage_block_size, spec.num_kv_heads, spec.head_size)
+def _strided_view(raw, dtype, shape, offset, block_stride):
+    dtype_size = torch.empty((), dtype=dtype).element_size()
+    if offset % dtype_size or block_stride % dtype_size:
+        raise ValueError("V4.1 packed cache offset/stride is not dtype aligned")
+    contiguous = torch.empty(shape[1:], device="meta").stride()
+    return torch.as_strided(
+        raw.view(dtype),
+        size=shape,
+        stride=(block_stride // dtype_size, *contiguous),
+        storage_offset=offset // dtype_size,
+    )
+
+
+def reshape_cache(raw: torch.Tensor, spec, num_blocks=None, offset=0, block_stride=0):
+    """Create typed zero-copy views over independent or packed raw storage."""
+    if not block_stride:
+        block_stride = spec.page_size_bytes
+    if num_blocks is None:
+        if raw.numel() % block_stride:
+            raise ValueError("V4.1 cache allocation is not a whole number of pages")
+        num_blocks = raw.numel() // block_stride
+    if raw.numel() < num_blocks * block_stride:
+        raise ValueError("V4.1 packed backing is smaller than its declared layout")
+
+    shape = (
+        num_blocks,
+        spec.storage_block_size,
+        spec.num_kv_heads,
+        spec.head_size,
+    )
+    if isinstance(spec, DeepseekV41IndexerSpec):
+        k = _strided_view(raw, spec.dtype, shape, offset, block_stride)
+        k_bytes = spec.storage_block_size * spec.num_kv_heads * spec.head_size
+        scale_shape = (
+            num_blocks,
+            spec.storage_block_size,
+            spec.num_kv_heads,
+            spec.scale_dim,
+        )
+        scale = _strided_view(
+            raw,
+            spec.scale_dtype,
+            scale_shape,
+            offset + k_bytes,
+            block_stride,
+        )
+        return k, scale
+    return _strided_view(raw, spec.dtype, shape, offset, block_stride)
 
 
 def validate_cache_runtime(vllm_config):

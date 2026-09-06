@@ -4401,11 +4401,25 @@ class NPUModelRunner(GPUModelRunner):
         if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
             if not all(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
                 raise ValueError("Mixed V4.1 cache allocation is not supported")
+            packed_backing = None
+            packed_size = None
             for allocation in kv_cache_config.kv_cache_tensors:
-                if len(allocation.shared_by) != 1 or allocation.offset or allocation.block_stride:
-                    raise ValueError("V4.1 initial allocator requires independent unpacked resources")
-                name = allocation.shared_by[0]
-                kv_cache_raw_tensors[name] = torch.zeros(allocation.size, dtype=torch.uint8, device=self.device)
+                if allocation.block_stride <= 0:
+                    raise ValueError("V4.1 requires a packed block-strided allocation")
+                if packed_backing is None:
+                    packed_backing = torch.zeros(
+                        allocation.size,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    )
+                    packed_size = allocation.size
+                elif allocation.size != packed_size:
+                    raise ValueError("V4.1 packed descriptors disagree on backing size")
+                for name in allocation.shared_by:
+                    kv_cache_raw_tensors[name] = packed_backing
+            expected = set(layer_kv_cache_spec)
+            if set(kv_cache_raw_tensors) != expected:
+                raise ValueError("V4.1 packed descriptors do not cover every resource")
             return kv_cache_raw_tensors
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
@@ -4646,6 +4660,12 @@ class NPUModelRunner(GPUModelRunner):
         """
         kv_caches: dict[str, torch.Tensor] = {}
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        layer_packing = {
+            name: (allocation.offset, allocation.block_stride)
+            for allocation in kv_cache_config.kv_cache_tensors
+            if allocation.block_stride > 0
+            for name in allocation.shared_by
+        }
         for group in self._kv_cache_spec_attn_group_iterator():
             attn_backend = group.backend
             current_kv_cache_spec = group.kv_cache_spec
@@ -4656,7 +4676,14 @@ class NPUModelRunner(GPUModelRunner):
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
 
                 if is_v41_spec(current_kv_cache_spec):
-                    kv_caches[layer_name] = reshape_cache(kv_cache_raw_tensors[layer_name], current_kv_cache_spec)
+                    offset, block_stride = layer_packing[layer_name]
+                    kv_caches[layer_name] = reshape_cache(
+                        kv_cache_raw_tensors[layer_name],
+                        current_kv_cache_spec,
+                        num_blocks=kv_cache_config.num_blocks,
+                        offset=offset,
+                        block_stride=block_stride,
+                    )
                     continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may

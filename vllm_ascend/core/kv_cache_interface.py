@@ -229,11 +229,13 @@ def register_ascend_kv_cache_specs() -> None:
     from vllm_ascend.core.deepseek_v41 import (
         DeepseekV41CompressorStateSpec,
         DeepseekV41FullSpec,
+        DeepseekV41IndexerSpec,
         DeepseekV41SWASpec,
     )
 
     for spec, manager in (
         (DeepseekV41FullSpec, FullAttentionManager),
+        (DeepseekV41IndexerSpec, FullAttentionManager),
         (DeepseekV41SWASpec, SlidingWindowManager),
         (DeepseekV41CompressorStateSpec, SlidingWindowManager),
     ):

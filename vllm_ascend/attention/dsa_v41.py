@@ -42,9 +42,19 @@ def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
     slots = slots[: values.shape[0]].long()
     valid = slots >= 0
     if valid.any():
-        cache.view(-1, cache.shape[-1]).index_copy_(
-            0, slots[valid], values[valid].to(cache.dtype)
-        )
+        physical = slots[valid]
+        pages = torch.div(physical, cache.shape[1], rounding_mode="floor")
+        rows = physical.remainder(cache.shape[1])
+        cache[pages, rows] = values[valid].to(cache.dtype)
+
+
+def gather_cache_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
+    """Read physical rows without flattening a block-strided packed view."""
+    cache = cache.squeeze(-2)
+    slots = slots.long()
+    pages = torch.div(slots, cache.shape[1], rounding_mode="floor")
+    rows = slots.remainder(cache.shape[1])
+    return cache[pages, rows]
 
 
 def paged_prefix(cache, block_table, length, block_size):

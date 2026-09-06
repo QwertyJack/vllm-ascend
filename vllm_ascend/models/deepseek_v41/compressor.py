@@ -76,7 +76,7 @@ class DeepseekV41Compressor(nn.Module):
                     vllm_config,
                     f"{prefix}.state_cache",
                     DeepseekV41CompressorStateSpec(
-                        block_size=vllm_config.cache_config.block_size,
+                        block_size=16,
                         num_kv_heads=1,
                         head_size=2 * self.width,
                         dtype=torch.float32,
