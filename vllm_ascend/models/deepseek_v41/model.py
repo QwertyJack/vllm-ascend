@@ -1,0 +1,670 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""DeepSeek V4.1 text model and source-shared hybrid-cache graph."""
+
+from collections.abc import Iterable, Iterator
+from dataclasses import dataclass
+from typing import Any
+
+import torch
+from vllm.forward_context import get_forward_context
+from vllm.distributed import get_pp_group
+
+from vllm_ascend.attention.dsa_v41 import (
+    DeepseekV41CacheBackend,
+    DeepseekV41CacheLayer,
+    scatter_cache,
+    small_op_attention,
+)
+from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41CompressorStateSpec,
+    DeepseekV41FullSpec,
+    DeepseekV41SWASpec,
+    validate_cache_runtime,
+)
+from vllm_ascend.models.deepseek_v4.model import (
+    AscendDeepseekV4ForCausalLM,
+    AscendDeepseekV4SWACache,
+    DeepseekV2DecoderLayer,
+    DeepseekV4Attention,
+    DeepseekV4Model,
+)
+
+from .compressor import DeepseekV41Compressor, _read, text_config_of
+from .indexer import DeepseekV41Indexer
+
+
+@dataclass(frozen=True)
+class DeepseekV41LayerRole:
+    """The attention and future Engram responsibilities of one backbone layer."""
+
+    layer_idx: int
+    compress_ratio: int
+    kv_source_layer: int | None
+    index_source_layer: int | None
+    is_kv_source: bool
+    is_index_source: bool
+    is_candidate_source: bool
+    uses_candidate_filter: bool
+    engram_slot: int | None
+
+    @property
+    def has_long_context(self) -> bool:
+        return self.compress_ratio > 0
+
+
+@dataclass(frozen=True)
+class DeepseekV41Topology:
+    """Validated, immutable model-wide source/consumer topology."""
+
+    layers: tuple[DeepseekV41LayerRole, ...]
+    kv_source_layers: tuple[int, ...]
+    index_source_layers: tuple[int, ...]
+    candidate_source_layer: int
+    candidate_topk_blocks: int
+    candidate_block_size: int
+    index_topk: int
+
+    def layer(self, layer_idx: int) -> DeepseekV41LayerRole:
+        return self.layers[layer_idx]
+
+    def kv_consumers(self, source_layer: int) -> tuple[int, ...]:
+        return tuple(role.layer_idx for role in self.layers if role.kv_source_layer == source_layer)
+
+    def index_consumers(self, source_layer: int) -> tuple[int, ...]:
+        return tuple(role.layer_idx for role in self.layers if role.index_source_layer == source_layer)
+
+
+class DeepseekV41SharedAttentionState:
+    """Per-forward handoff between index sources and their consumer layers."""
+
+    def __init__(self):
+        self.topk_indices = None
+        self.candidates = None
+
+    def reset(self):
+        self.topk_indices = None
+        self.candidates = None
+
+
+def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:
+    value = _read(config, name)
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, int) for item in value):
+        raise ValueError(f"DeepSeek V4.1 {name} must be a list of integers")
+    return tuple(value)
+
+
+def _latest_source(layer_idx: int, sources: tuple[int, ...]) -> int | None:
+    return next((source for source in reversed(sources) if source <= layer_idx), None)
+
+
+def build_layer_plan(config: Any) -> DeepseekV41Topology:
+    """Build and validate the V4.1 layer-sharing graph from a text config.
+
+    ``config`` may be a Transformers config object or the raw ``text_config``
+    dictionary.  Extra compression ratios for speculative layers are allowed,
+    but only the first ``num_hidden_layers`` entries describe the backbone.
+    """
+
+    config = text_config_of(config)
+    num_layers = int(_read(config, "num_hidden_layers"))
+    ratios = _as_int_tuple(config, "compress_ratios")
+    kv_sources = _as_int_tuple(config, "kv_source_layers")
+    index_sources = _as_int_tuple(config, "index_source_layers")
+    engram_layers = _as_int_tuple(config, "engram_layer_ids")
+    candidate_source = int(_read(config, "candidate_source_layer"))
+    candidate_topk_blocks = int(_read(config, "candidate_topk_blocks"))
+    candidate_block_size = int(_read(config, "candidate_block_size"))
+    index_topk = int(_read(config, "index_topk"))
+
+    if num_layers <= 0:
+        raise ValueError("DeepSeek V4.1 num_hidden_layers must be positive")
+    if len(ratios) < num_layers:
+        raise ValueError(
+            "DeepSeek V4.1 compress_ratios must cover every backbone layer: "
+            f"got {len(ratios)} ratios for {num_layers} layers"
+        )
+    ratios = ratios[:num_layers]
+    if any(ratio not in (0, 1, 2) for ratio in ratios):
+        raise ValueError(f"DeepSeek V4.1 backbone only supports compression ratios 0, 1 and 2; got {ratios}")
+
+    for name, sources in (("kv_source_layers", kv_sources), ("index_source_layers", index_sources)):
+        if tuple(sorted(set(sources))) != sources:
+            raise ValueError(f"DeepSeek V4.1 {name} must be sorted and unique")
+        if any(source < 0 or source >= num_layers for source in sources):
+            raise ValueError(f"DeepSeek V4.1 {name} contains a layer outside the backbone")
+        if any(ratios[source] == 0 for source in sources):
+            raise ValueError(f"DeepSeek V4.1 {name} cannot point to a local-only layer")
+
+    if not set(kv_sources).issubset(index_sources):
+        raise ValueError("Every DeepSeek V4.1 KV source must also be an index source")
+    if candidate_source not in kv_sources:
+        raise ValueError("DeepSeek V4.1 candidate_source_layer must be a KV source")
+    if candidate_topk_blocks <= 0 or candidate_block_size <= 0 or index_topk <= 0:
+        raise ValueError("DeepSeek V4.1 candidate and index TopK values must be positive")
+    if len(set(engram_layers)) != len(engram_layers):
+        raise ValueError("DeepSeek V4.1 engram_layer_ids must be unique")
+    if any(layer < 0 or layer >= num_layers for layer in engram_layers):
+        raise ValueError("DeepSeek V4.1 engram_layer_ids contains a layer outside the backbone")
+
+    engram_slots = {layer_idx: slot for slot, layer_idx in enumerate(engram_layers)}
+    roles: list[DeepseekV41LayerRole] = []
+    for layer_idx, ratio in enumerate(ratios):
+        kv_source = _latest_source(layer_idx, kv_sources) if ratio else None
+        index_source = _latest_source(layer_idx, index_sources) if ratio else None
+        if ratio and (kv_source is None or index_source is None):
+            raise ValueError(f"DeepSeek V4.1 layer {layer_idx} has long-context attention but no source layer")
+        if kv_source is not None and ratios[kv_source] != ratio:
+            raise ValueError(
+                f"DeepSeek V4.1 layer {layer_idx} has ratio {ratio}, but its KV source "
+                f"layer {kv_source} has ratio {ratios[kv_source]}"
+            )
+
+        roles.append(
+            DeepseekV41LayerRole(
+                layer_idx=layer_idx,
+                compress_ratio=ratio,
+                kv_source_layer=kv_source,
+                index_source_layer=index_source,
+                is_kv_source=layer_idx in kv_sources,
+                is_index_source=layer_idx in index_sources,
+                is_candidate_source=layer_idx == candidate_source,
+                # Consumer layers inherit the selection policy of their index
+                # source.  For example, layer 26 reuses layer 24 TopK, and that
+                # TopK was computed inside layer 20's candidate blocks.
+                uses_candidate_filter=index_source is not None and index_source > candidate_source,
+                engram_slot=engram_slots.get(layer_idx),
+            )
+        )
+
+    return DeepseekV41Topology(
+        layers=tuple(roles),
+        kv_source_layers=kv_sources,
+        index_source_layers=index_sources,
+        candidate_source_layer=candidate_source,
+        candidate_topk_blocks=candidate_topk_blocks,
+        candidate_block_size=candidate_block_size,
+        index_topk=index_topk,
+    )
+
+
+def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
+    """Describe the source-shared V4.1 cache graph without building the model."""
+    config = text_config_of(config)
+    block_size = vllm_config.cache_config.block_size
+    if block_size <= 0 or block_size % 2:
+        raise ValueError("V4.1 logical block_size must be a positive multiple of two")
+    width = _read(config, "head_dim")
+    index_width = _read(config, "index_head_dim")
+    window = _read(config, "sliding_window")
+    specs = {}
+    for role in build_layer_plan(config).layers:
+        attn_prefix = f"{prefix}.layers.{role.layer_idx}.self_attn"
+        specs[f"{attn_prefix}.swa_cache"] = DeepseekV41SWASpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=width,
+            dtype=torch.bfloat16,
+            sliding_window=window,
+        )
+        if not role.is_kv_source:
+            continue
+        specs[f"{attn_prefix}.long_kv_cache"] = DeepseekV41FullSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=width,
+            dtype=torch.bfloat16,
+            compress_ratio=role.compress_ratio,
+        )
+        specs[f"{attn_prefix}.indexer.k_cache"] = DeepseekV41FullSpec(
+            block_size=block_size,
+            num_kv_heads=1,
+            head_size=index_width,
+            dtype=torch.bfloat16,
+            compress_ratio=role.compress_ratio,
+        )
+        if role.compress_ratio == 2:
+            specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(
+                block_size=block_size,
+                num_kv_heads=1,
+                head_size=2 * width,
+                dtype=torch.float32,
+                sliding_window=2,
+            )
+    return specs
+
+
+class AscendDeepseekV41SWACache(AscendDeepseekV4SWACache):
+    """V4 execution-compatible SWA plane participating in V4.1 grouping."""
+
+    def get_kv_cache_spec(self, vllm_config):
+        spec = super().get_kv_cache_spec(vllm_config)
+        return DeepseekV41SWASpec(
+            block_size=spec.block_size,
+            num_kv_heads=spec.num_kv_heads,
+            head_size=spec.head_size,
+            dtype=spec.dtype,
+            sliding_window=spec.sliding_window,
+            cache_dtype_str=spec.cache_dtype_str,
+            model_version="deepseek_v4",
+            alignment=spec.alignment,
+        )
+
+    def get_attn_backend(self):
+        return DeepseekV41CacheBackend
+
+
+class DeepseekV41Attention(DeepseekV4Attention):
+    """V4 small-op attention plus V4.1 source-owned cache resources.
+
+    The first eager milestone deliberately executes the proven V4 SWA small-op
+    path.  Long KV/index planes are nevertheless allocated only at source
+    layers, so consumers can subsequently reuse them without changing the
+    framework-side hybrid grouping contract.
+    """
+
+    swa_cache_cls = AscendDeepseekV41SWACache
+
+    def __init__(
+        self,
+        vllm_config,
+        config,
+        max_position_embeddings=0,
+        cache_config=None,
+        quant_config=None,
+        prefix="",
+        topk_indices_buffer=None,
+    ):
+        config = text_config_of(config)
+        validate_cache_runtime(vllm_config)
+        layer_idx = int(prefix.split(".")[-2])
+        topology = build_layer_plan(config)
+        role = topology.layer(layer_idx)
+        # Reuse V4's quant-aware projections and stable SWA eager backend.  A
+        # zero ratio prevents V4 from creating its incompatible c4/c128 planes.
+        original_ratios = config.compress_ratios
+        config.compress_ratios = tuple(0 for _ in original_ratios)
+        try:
+            super().__init__(
+                vllm_config=vllm_config,
+                config=config,
+                max_position_embeddings=max_position_embeddings,
+                cache_config=cache_config,
+                quant_config=quant_config,
+                prefix=prefix,
+                topk_indices_buffer=topk_indices_buffer,
+            )
+        finally:
+            config.compress_ratios = original_ratios
+        if role.has_long_context:
+            from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
+
+            self.rotary_emb = ComplexExpRotaryEmbedding(
+                vllm_config=vllm_config,
+                layername=f"{prefix}.attn",
+                head_size=self.rope_head_dim,
+                rotary_dim=self.rope_head_dim,
+                max_position_embeddings=max_position_embeddings,
+                is_neox_style=False,
+                scaling_factor=config.rope_parameters["factor"],
+                base=config.compress_rope_theta,
+                beta_fast=config.rope_parameters["beta_fast"],
+                beta_slow=config.rope_parameters["beta_slow"],
+                rope_groups=["default"],
+            )
+        block_size = vllm_config.cache_config.block_size
+        if block_size <= 0 or block_size % 2:
+            raise ValueError("V4.1 logical block_size must be a positive multiple of two")
+        owned = []
+        if role.is_kv_source:
+            owned.extend((f"{prefix}.long_kv_cache", f"{prefix}.indexer.k_cache"))
+            if role.compress_ratio == 2:
+                owned.append(f"{prefix}.compressor.state_cache")
+        duplicates = set(owned) & vllm_config.compilation_config.static_forward_context.keys()
+        if duplicates:
+            raise ValueError(f"Duplicate V4.1 cache prefixes: {sorted(duplicates)}")
+        self.role = role
+        self.topology = topology
+        self.shared_state = None
+        self.prefix = prefix
+        width = _read(config, "head_dim")
+        self.softmax_scale = width**-0.5
+        if role.is_kv_source:
+            self.long_kv_cache = DeepseekV41CacheLayer(
+                vllm_config,
+                f"{prefix}.long_kv_cache",
+                DeepseekV41FullSpec(
+                    block_size=block_size,
+                    num_kv_heads=1,
+                    head_size=width,
+                    dtype=torch.bfloat16,
+                    compress_ratio=role.compress_ratio,
+                ),
+            )
+        self.compressor = (
+            DeepseekV41Compressor(config, role.compress_ratio, vllm_config, f"{prefix}.compressor")
+            if role.is_kv_source
+            else None
+        )
+        self.indexer = (
+            DeepseekV41Indexer(
+                config,
+                role.is_kv_source,
+                vllm_config,
+                f"{prefix}.indexer",
+                role.compress_ratio,
+                quant_config=quant_config,
+            )
+            if role.is_index_source
+            else None
+        )
+        root = prefix.rsplit(".layers.", 1)[0]
+        source = f"{root}.layers.{role.kv_source_layer}.self_attn"
+        self.long_kv_source_prefix = f"{source}.long_kv_cache" if role.has_long_context else None
+        self.index_k_source_prefix = f"{source}.indexer.k_cache" if role.has_long_context else None
+        self.index_source_layer = role.index_source_layer
+
+    def _project_q_kv(self, hidden_states, positions):
+        q_a = self.wq_a(hidden_states)
+        qr = self.q_norm(q_a)
+        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
+        kv = self.kv_norm(self.wkv(hidden_states))
+
+        # Use the same registered RoPE cache as V4's small-op path.  V4.1's
+        # compressed-theta registration replaces this once the source ratio
+        # is nonzero; both Q and the local KV use that theta by design.
+        from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+
+        cos, sin = get_cos_and_sin_dsa(positions)
+        cos = cos[self.rotary_emb.layername]
+        sin = sin[self.rotary_emb.layername]
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        kv = kv.view(-1, 1, self.head_dim)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            kv.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        return q.to(hidden_states.dtype), qr, kv.squeeze(1), cos, sin
+
+    def _write_compressed_source(self, hidden_states, positions, metadata):
+        assert self.compressor is not None
+        ratio = self.role.compress_ratio
+        if ratio == 1:
+            latent = self.compressor(hidden_states, 0)
+            completed = torch.ones_like(positions, dtype=torch.bool)
+        else:
+            state_meta = metadata[self.compressor.state_cache.prefix]
+            state_cache = self.compressor.state_cache.kv_cache[0].squeeze(-2)
+            kv = self.compressor.wkv(hidden_states.float())
+            score = self.compressor.wgate(hidden_states.float())
+            state_rows = torch.cat((kv, score), -1)
+            scatter_cache(
+                self.compressor.state_cache.kv_cache[0],
+                state_meta.slot_mapping,
+                state_rows,
+            )
+            completed = positions.remainder(ratio) == ratio - 1
+            completed_slots = state_meta.slot_mapping[: positions.shape[0]][completed].long()
+            current = state_cache.view(-1, state_cache.shape[-1]).index_select(0, completed_slots)
+            previous = state_cache.view(-1, state_cache.shape[-1]).index_select(
+                0, completed_slots - 1
+            )
+            pair = torch.stack((previous, current), 1)
+            latent = (
+                pair[..., : self.head_dim]
+                * pair[..., self.head_dim :].softmax(1)
+            ).sum(1)
+            latent = self.compressor.norm(latent.to(hidden_states.dtype))
+        if latent.shape[0] == 0:
+            return
+
+        source_meta = metadata[self.long_kv_cache.prefix]
+        source_positions = positions[completed] + 1 - ratio
+        from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+
+        cos, sin = get_cos_and_sin_dsa(source_positions)
+        cos = cos[self.rotary_emb.layername]
+        sin = sin[self.rotary_emb.layername]
+        assert self.indexer is not None
+        index_meta = metadata[self.indexer.k_cache.prefix]
+        self.indexer.update_keys(
+            latent,
+            index_meta.slot_mapping[: positions.shape[0]][completed],
+            cos,
+            sin,
+        )
+        latent = latent.view(-1, 1, self.head_dim)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            latent.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        scatter_cache(
+            self.long_kv_cache.kv_cache[0],
+            source_meta.slot_mapping[: positions.shape[0]][completed],
+            latent.squeeze(1),
+        )
+
+    def _select_sparse_indices(self, hidden_states, qr, positions, cos, sin, metadata):
+        if not self.role.has_long_context:
+            return None
+        if self.shared_state is None:
+            raise RuntimeError("V4.1 shared attention state is not initialized")
+        if not self.role.is_index_source:
+            if self.shared_state.topk_indices is None:
+                raise RuntimeError("V4.1 sparse consumer ran before its index source")
+            return self.shared_state.topk_indices
+
+        assert self.indexer is not None
+        context = get_forward_context().no_compile_layers
+        source_layer = context[self.index_k_source_prefix]
+        selected, candidates = self.indexer.select(
+            hidden_states,
+            qr,
+            positions,
+            cos,
+            sin,
+            source_layer.kv_cache[0],
+            metadata[self.index_k_source_prefix],
+            is_candidate_source=self.role.is_candidate_source,
+            uses_candidate_filter=self.role.uses_candidate_filter,
+            candidate_topk_blocks=self.topology.candidate_topk_blocks,
+            candidate_block_size=self.topology.candidate_block_size,
+            candidates=self.shared_state.candidates,
+        )
+        self.shared_state.topk_indices = selected
+        self.shared_state.candidates = candidates
+        return selected
+
+    def _small_op_attention(self, q, positions, metadata, compressed_indices):
+        swa_layer = self.dsa_attn.swa_cache_layer
+        swa_meta = metadata[swa_layer.prefix]
+        swa_cache = swa_layer.kv_cache[0]
+        source_meta = None
+        source_cache = None
+        if self.role.has_long_context:
+            context = get_forward_context().no_compile_layers
+            source_layer = context[self.long_kv_source_prefix]
+            source_meta = metadata[self.long_kv_source_prefix]
+            source_cache = source_layer.kv_cache[0]
+
+        return small_op_attention(
+            q,
+            positions,
+            swa_cache,
+            swa_meta,
+            source_cache=source_cache,
+            source_metadata=source_meta,
+            compress_ratio=self.role.compress_ratio,
+            window_size=self.window_size,
+            index_topk=self.topology.index_topk,
+            compressed_indices=compressed_indices,
+            sinks=self.attn_sink,
+            softmax_scale=self.softmax_scale,
+        )
+
+    def forward(self, positions, hidden_states, llama_4_scaling=None):
+        forward_context = get_forward_context()
+        metadata = forward_context.attn_metadata
+        if metadata is None:
+            return torch.zeros_like(hidden_states)
+        q, qr, kv, cos, sin = self._project_q_kv(hidden_states, positions)
+        swa_layer = self.dsa_attn.swa_cache_layer
+        scatter_cache(swa_layer.kv_cache[0], metadata[swa_layer.prefix].slot_mapping, kv)
+        if self.role.is_kv_source:
+            self._write_compressed_source(hidden_states, positions, metadata)
+        compressed_indices = self._select_sparse_indices(
+            hidden_states, qr, positions, cos, sin, metadata
+        )
+        o = self._small_op_attention(q, positions, metadata, compressed_indices)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            o.unsqueeze(1),
+            cos,
+            -sin,
+            rotary_mode="interleave",
+            partial_slice=[self.nope_head_dim, self.head_dim],
+        )
+        output = torch.empty_like(hidden_states)
+        self.dsa_attn.dsa_attn.impl._forward_o_proj(o, output)
+        return output
+
+
+
+class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
+    """V4.1 block with the checkpoint's delayed mHC coefficient handoff."""
+
+    attention_cls = DeepseekV41Attention
+
+    def hc_mixes(self, x, hc_fn, hc_scale, hc_base):
+        x_float = x.float()
+        flat = x_float.flatten(-2)
+        mixes = torch.nn.functional.linear(flat, hc_fn)
+        mixes *= torch.rsqrt(flat.square().mean(-1, keepdim=True) + self.norm_eps)
+        pre, post, comb = mixes.split(
+            [self.hc_mult, self.hc_mult, self.hc_mult * self.hc_mult], -1
+        )
+        pre = torch.sigmoid(pre * hc_scale[0] + hc_base[: self.hc_mult]) + self.hc_eps
+        post = 2 * torch.sigmoid(
+            post * hc_scale[1] + hc_base[self.hc_mult : 2 * self.hc_mult]
+        )
+        comb = comb.unflatten(-1, (self.hc_mult, self.hc_mult))
+        comb = comb * hc_scale[2] + hc_base[2 * self.hc_mult :].view(
+            self.hc_mult, self.hc_mult
+        )
+        comb = comb.softmax(-1) + self.hc_eps
+        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        for _ in range(self.hc_sinkhorn_iters - 1):
+            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
+            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        return pre, post, comb
+
+    @staticmethod
+    def hc_collapse(x, pre_mix):
+        return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
+
+    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
+        """Compatibility helper for direct mHC operator validation.
+
+        Runtime forward uses ``hc_mixes`` plus the previous sublayer's
+        coefficient explicitly; this helper must not be used for that handoff.
+        """
+        pre, post, comb = self.hc_mixes(x, hc_fn, hc_scale, hc_base)
+        return self.hc_collapse(x, pre), post, comb
+
+    def hc_post(self, x, residual, post, comb):
+        y = post.unsqueeze(-1) * x.unsqueeze(-2)
+        y += (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(-3)
+        return y.to(x.dtype)
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        pre_mix,
+        llama_4_scaling=None,
+        input_ids=None,
+    ):
+        residual = hidden_states
+        attn_pre, attn_post, attn_comb = self.hc_mixes(
+            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        )
+        x = self.input_layernorm(self.hc_collapse(hidden_states, pre_mix))
+        x = self.self_attn(positions, x, llama_4_scaling)
+        hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
+
+        residual = hidden_states
+        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(
+            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        )
+        x = self.post_attention_layernorm(self.hc_collapse(hidden_states, attn_pre))
+        x = self.mlp(x, input_ids)
+        hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
+        return hidden_states, ffn_pre
+
+
+class DeepseekV41Model(DeepseekV4Model):
+    """Single V4.1 backbone entry, matching ``deepseek_v4/model.py``."""
+
+    decoder_layer_cls = DeepseekV41DecoderLayer
+
+    def __init__(self, *, vllm_config, prefix=""):
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
+        # V4.1 collapses with the last block's ffn_pre; it has no hc_head
+        # projection in the checkpoint.
+        del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
+        self.shared_attention_state = DeepseekV41SharedAttentionState()
+        for layer in self.layers:
+            if isinstance(layer, DeepseekV41DecoderLayer):
+                layer.self_attn.shared_state = self.shared_attention_state
+
+    def forward(self, input_ids, positions, intermediate_tensors, inputs_embeds=None):
+        if not get_pp_group().is_first_rank or not get_pp_group().is_last_rank:
+            raise NotImplementedError("V4.1 eager milestone currently requires PP=1")
+        hidden_states = inputs_embeds if inputs_embeds is not None else self.embed_input_ids(input_ids)
+        self.shared_attention_state.reset()
+        hidden_states = hidden_states.unsqueeze(1).repeat(1, self.hc_mult, 1)
+        pre_mix = hidden_states.new_zeros(
+            hidden_states.shape[0], self.hc_mult, dtype=torch.float32
+        )
+        pre_mix[:, 0] = 1.0
+        last_layer = None
+        for layer in self.layers:
+            last_layer = layer
+            hidden_states, pre_mix = layer(
+                positions, hidden_states, pre_mix, None, input_ids=input_ids
+            )
+        assert last_layer is not None
+        hidden_states = last_layer.hc_collapse(hidden_states, pre_mix)
+        return self.norm(hidden_states)
+
+
+class AscendDeepseekV41ForCausalLM(AscendDeepseekV4ForCausalLM):
+    model_cls = DeepseekV41Model
+    # Engram is intentionally disabled until its tables can be HBM-sharded.
+    _DEFERRED_WEIGHT_MARKERS = (".engram.",)
+    _DEFERRED_WEIGHT_PREFIXES = ("aligner.", "vision.", "image_", "mtp.")
+
+    @classmethod
+    def _is_milestone_weight(cls, name):
+        return not name.startswith(cls._DEFERRED_WEIGHT_PREFIXES) and not any(
+            marker in name for marker in cls._DEFERRED_WEIGHT_MARKERS
+        )
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        def milestone_weights() -> Iterator[tuple[str, torch.Tensor]]:
+            for name, tensor in weights:
+                if self._is_milestone_weight(name):
+                    yield name, tensor
+
+        return super().load_weights(milestone_weights())

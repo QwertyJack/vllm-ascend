@@ -335,7 +335,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             else:
                 self.attention_groups.append(SpecGroup(spec, [i], manager_cls, use_eagle))
 
-        assert len(self.attention_groups) > 1, "HybridKVCacheCoordinator requires at least two attention groups."
+        # DeepSeek boot configurations may retain multiple physical cache
+        # groups while all of them use one identical attention spec (for
+        # example, when every V4.1 layer temporarily runs the SWA path).  The
+        # Ascend coordinator's grouped lookup works for this degenerate case,
+        # so do not reject it merely because the unique-spec count is one.
+        assert self.attention_groups, "KV cache coordinator requires at least one attention group."
 
         # Put full attention first: its efficient left-to-right scan provides
         # a tighter initial bound, reducing work for subsequent groups.

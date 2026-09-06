@@ -151,6 +151,12 @@ packed_modules_model_mapping: dict[str, dict[str, list[str]]] = {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
     },
+    "deepseek_v4.1": {
+        # The runtime modules use V4's fused names, but the V4.1 ModelSlim
+        # description retains the checkpoint's w1/w2/w3 shard names.
+        "gate_up_proj": ["w1", "w3"],
+        "experts": ["experts.0.w1", "experts.0.w2", "experts.0.w3"],
+    },
     "pangu_ultra_moe": {
         "gate_up_proj": ["gate_proj", "up_proj"],
         "experts": ["experts.0.gate_proj", "experts.0.up_proj", "experts.0.down_proj"],
@@ -394,6 +400,16 @@ QUANT_MODEL_PREFIX_MAPPINGS = {
         "embed.": "model.embed_tokens.",
         "head.": "lm_head.",
     },
+    "deepseek_v4.1": {
+        # V4.1 ModelSlim descriptions keep the original checkpoint names,
+        # while the runtime reuses the V4 module tree. Map runtime prefixes
+        # back to the checkpoint namespace for quant-scheme lookup.
+        "model.layers.": "layers.",
+        "model.embed_tokens.": "embed.",
+        "model.embed_tokens": "embed",
+        "lm_head.": "head.",
+        "lm_head": "head",
+    },
 }
 
 
@@ -406,6 +422,20 @@ QUANT_MODEL_SUBSTR_MAPPINGS = {
         ".ffn.": ".mlp.",
         ".ffn_norm.": ".post_attention_layernorm.",
         ".attn_norm.": ".input_layernorm.",
+    },
+    "deepseek_v4.1": {
+        ".self_attn.": ".attn.",
+        ".gate_proj.": ".w1.",
+        ".gate_proj": ".w1",
+        ".down_proj.": ".w2.",
+        ".down_proj": ".w2",
+        ".up_proj.": ".w3.",
+        ".up_proj": ".w3",
+        ".mlp.": ".ffn.",
+        ".post_attention_layernorm.": ".ffn_norm.",
+        ".post_attention_layernorm": ".ffn_norm",
+        ".input_layernorm.": ".attn_norm.",
+        ".input_layernorm": ".attn_norm",
     },
     # The step3.5 MTP draft nests its decoder block under ".mtp_block.", but the
     # checkpoint's quant_model_description.json keys it without that infix
@@ -632,6 +662,15 @@ class AscendModelSlimConfig(QuantizationConfig):
 
     @classmethod
     def from_config(cls, config: dict[str, Any]) -> "AscendModelSlimConfig":
+        # Some ModelSlim checkpoints keep only format metadata in
+        # config.json and store the per-parameter description in
+        # quant_model_description.json.  Treat that metadata-only form as a
+        # deferred file load; otherwise maybe_update_config() sees a non-empty
+        # dict and never reads the actual layer descriptions.
+        if config.get("quant_method") == ASCEND_QUANTIZATION_METHOD and not any(
+            isinstance(name, str) and name.endswith(".weight") for name in config
+        ):
+            return cls()
         return cls(config)
 
     @classmethod

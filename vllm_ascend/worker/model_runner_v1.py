@@ -117,6 +117,7 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
+from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -134,6 +135,10 @@ from vllm_ascend.compilation.acl_graph import (
     update_full_graph_params,
 )
 from vllm_ascend.compilation.breakable_aclgraph import BreakableACLGraphWrapper
+from vllm_ascend.core.deepseek_v41 import (
+    is_v41_spec,
+    reshape_cache,
+)
 from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.kv_transfer.kv_pool.ascend_store.layerwise_cache_layout import (
     apply_layerwise_kv_cache_plan,
@@ -4203,7 +4208,16 @@ class NPUModelRunner(GPUModelRunner):
             logger.debug("%s reuses KV cache of %s", layer_name, target_layer_name)
             kv_caches[layer_name] = kv_caches[target_layer_name]
 
-        if self.model_config.hf_text_config.model_type == "deepseek_v4":
+        if any(
+            isinstance(self.compilation_config.static_forward_context[name], DeepseekV41CacheLayer)
+            for name in kv_caches
+        ):
+            if self.kv_caches:
+                raise ValueError("V4.1 cache tensors were already bound")
+            for name in sorted(kv_caches):
+                self.compilation_config.static_forward_context[name].kv_cache = [kv_caches[name]]
+                self.kv_caches.append(kv_caches[name])
+        elif self.model_config.hf_text_config.model_type == "deepseek_v4":
             from vllm_ascend.utils import extract_dsv4_layer_index
 
             assert len(self.kv_caches) == 0
@@ -4384,6 +4398,15 @@ class NPUModelRunner(GPUModelRunner):
         # prefill disaggregation need the addr of cache tensor be aligned with 2M
         alignment = 2 * 1024 * 1024
         layer_kv_cache_spec = self._get_layer_kv_cache_specs(kv_cache_config)
+        if any(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
+            if not all(is_v41_spec(spec) for spec in layer_kv_cache_spec.values()):
+                raise ValueError("Mixed V4.1 cache allocation is not supported")
+            for allocation in kv_cache_config.kv_cache_tensors:
+                if len(allocation.shared_by) != 1 or allocation.offset or allocation.block_stride:
+                    raise ValueError("V4.1 initial allocator requires independent unpacked resources")
+                name = allocation.shared_by[0]
+                kv_cache_raw_tensors[name] = torch.zeros(allocation.size, dtype=torch.uint8, device=self.device)
+            return kv_cache_raw_tensors
         # If some tensors are shared by linear layers and attention layers,
         # the same tensor format must be maintained even if some layers
         # have only linear or attention layers, for example, the mtp layer.
@@ -4631,6 +4654,10 @@ class NPUModelRunner(GPUModelRunner):
                     continue
 
                 current_kv_cache_spec = layer_kv_cache_spec[layer_name]
+
+                if is_v41_spec(current_kv_cache_spec):
+                    kv_caches[layer_name] = reshape_cache(kv_cache_raw_tensors[layer_name], current_kv_cache_spec)
+                    continue
 
                 # TODO: remove this after the OOM issue is located and fixed, otherwise, some model may
                 # encounter OOM issue
@@ -5249,6 +5276,8 @@ class NPUModelRunner(GPUModelRunner):
                 # or enable more requests to be processed simultaneously.
                 self.shared_kv_cache_layers[layer_name] = kv_tgt_layer
                 continue
+            elif isinstance(attn_module, DeepseekV41CacheLayer):
+                kv_cache_spec[layer_name] = attn_module.get_kv_cache_spec(self.vllm_config)
             elif self.use_compress:
                 # Skip modules that don't need KV cache (eg encoder-only attention)
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):

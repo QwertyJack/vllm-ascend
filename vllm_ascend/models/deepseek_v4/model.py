@@ -456,6 +456,8 @@ def _get_llama_4_scaling(
 
 
 class DeepseekV4Attention(nn.Module):
+    swa_cache_cls = AscendDeepseekV4SWACache
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -605,7 +607,7 @@ class DeepseekV4Attention(nn.Module):
                 )
 
         k_dtype = get_dsv4_attn_kv_dtype(vllm_config)
-        swa_cache_layer = AscendDeepseekV4SWACache(
+        swa_cache_layer = self.swa_cache_cls(
             head_dim=self.head_dim,
             window_size=self.window_size,
             dtype=k_dtype,
@@ -660,6 +662,8 @@ class DeepseekV4Attention(nn.Module):
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    attention_cls = DeepseekV4Attention
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -684,7 +688,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self.layer_idx = layer_idx
         self.norm_eps = config.rms_norm_eps
 
-        attn_cls = DeepseekV4Attention
+        attn_cls = self.attention_cls
 
         self.self_attn = attn_cls(
             vllm_config=vllm_config,
@@ -756,6 +760,7 @@ class DeepseekV2DecoderLayer(nn.Module):
 @support_torch_compile
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     fall_back_to_pt_during_load = False
+    decoder_layer_cls = DeepseekV2DecoderLayer
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -793,7 +798,7 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.embed_tokens = PPMissingLayer()
         self.start_layer, self.end_layer, self.layers = make_layers(
             config.num_hidden_layers,
-            lambda prefix: DeepseekV2DecoderLayer(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
+            lambda prefix: self.decoder_layer_cls(vllm_config, prefix, topk_indices_buffer=topk_indices_buffer),
             prefix=f"{prefix}.layers",
         )
 
