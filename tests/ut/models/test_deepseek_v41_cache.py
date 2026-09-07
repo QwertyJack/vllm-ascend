@@ -268,13 +268,65 @@ def test_state_metadata_keeps_original_token_slots(config, runtime):
         slot_mapping=slots,
         block_table_tensor=torch.tensor([[7, 3]]),
         query_start_loc=torch.tensor([0, 2]),
+        query_start_loc_cpu=torch.tensor([0, 2]),
         seq_lens=torch.tensor([17]),
+        seq_lens_cpu=torch.tensor([17]),
+        num_reqs=1,
+        num_actual_tokens=2,
+        num_input_tokens=2,
+        max_query_len=2,
+        max_seq_len=17,
+        is_prefilling=torch.tensor([True]),
     )
     metadata = builder.build(0, common)
     assert metadata.is_compressor_state
     assert metadata.slot_mapping is slots
     assert metadata.compress_ratio == 1
     assert metadata.storage_block_size == 16
+    assert metadata.start_pos.tolist() == [15]
+    assert metadata.cache_seq_lens.tolist() == [17]
+    assert metadata.cache_query_lens.tolist() == [2]
+    assert metadata.cache_query_start_loc.tolist() == [0, 2]
+    assert metadata.num_cache_tokens == 2
+    assert metadata.num_prefills == 1
+    assert metadata.num_prefill_tokens == 2
+
+
+def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runtime):
+    specs = collect_specs(runtime)
+    spec = specs["model.layers.2.self_attn.long_kv_cache"]
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    # Request 0 starts halfway through a compression pair; request 1 ends
+    # with an incomplete pair. Only completed pairs become cache rows.
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([1, 2, 3, 65, 66]),
+        block_table_tensor=torch.tensor([[5, 7], [9, 0]]),
+        query_start_loc=torch.tensor([0, 3, 5]),
+        query_start_loc_cpu=torch.tensor([0, 3, 5]),
+        seq_lens=torch.tensor([4, 3]),
+        seq_lens_cpu=torch.tensor([4, 3]),
+        num_reqs=2,
+        num_actual_tokens=5,
+        num_input_tokens=5,
+        max_query_len=3,
+        max_seq_len=4,
+        is_prefilling=torch.tensor([True, False]),
+    )
+    metadata = builder.build(0, common)
+    assert metadata.seq_lens.tolist() == [4, 3]
+    assert metadata.query_lens.tolist() == [3, 2]
+    assert metadata.start_pos.tolist() == [1, 1]
+    assert metadata.cache_seq_lens.tolist() == [2, 1]
+    assert metadata.cache_start_pos.tolist() == [0, 0]
+    assert metadata.cache_query_lens.tolist() == [2, 1]
+    assert metadata.cache_query_start_loc.tolist() == [0, 2, 3]
+    assert metadata.num_cache_tokens == 3
+    assert metadata.max_cache_seq_len == 2
+    assert metadata.slot_mapping.tolist() == [0, -1, 1, 32, -1]
+    assert metadata.num_prefills == 1
+    assert metadata.num_prefill_tokens == 3
+    assert metadata.num_decodes == 1
+    assert metadata.num_decode_tokens == 2
 
 
 def test_actual_attention_parameter_ownership(config, runtime):

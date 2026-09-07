@@ -30,6 +30,15 @@ from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 
 @dataclass
 class DeepseekV41Metadata(AttentionMetadata):
+    """Scheduler and cache-plane contract for one V4.1 cache resource.
+
+    ``seq_lens``/``query_start_loc`` always stay in original-token
+    coordinates, matching the common vLLM metadata. The ``cache_*`` fields
+    describe the rows visible to the concrete cache plane. Keeping both
+    coordinate systems here lets future fused kernels replace the eager path
+    without rebuilding scheduling metadata in the model.
+    """
+
     block_table: torch.Tensor
     query_start_loc: torch.Tensor
     seq_lens: torch.Tensor
@@ -44,16 +53,54 @@ class DeepseekV41Metadata(AttentionMetadata):
     num_actual_tokens: int = 0
     num_input_tokens: int = 0
     num_reqs: int = 0
+    num_actual_reqs: int = 0
+    num_decodes: int = 0
+    num_decode_tokens: int = 0
+    num_prefills: int = 0
+    num_prefill_tokens: int = 0
+    logical_block_size: int = 0
+    query_start_loc_cpu: torch.Tensor | None = None
+    seq_lens_cpu: torch.Tensor | None = None
+    query_lens: torch.Tensor | None = None
+    start_pos: torch.Tensor | None = None
+    cache_seq_lens: torch.Tensor | None = None
+    cache_query_lens: torch.Tensor | None = None
+    cache_query_start_loc: torch.Tensor | None = None
+    cache_start_pos: torch.Tensor | None = None
+    max_query_len: int = 0
+    max_seq_len: int = 0
+    max_cache_seq_len: int = 0
+    num_cache_tokens: int = 0
+    attn_state: Any = None
+    is_prefilling: torch.Tensor | None = None
+    causal: bool | torch.Tensor = True
+    ori_win_left: int = 0
+    ori_win_right: int = 0
+
+
+@dataclass(frozen=True)
+class DeepseekV41CompressorMetadata:
+    """V4-shaped cache/state bundle consumed by the compressor stage."""
+
+    cache: DeepseekV41Metadata
+    state: DeepseekV41Metadata | None = None
+
+
+@dataclass(frozen=True)
+class DeepseekV41IndexerMetadata:
+    """V4-shaped source cache bundle consumed by the indexer stage."""
+
+    cache: DeepseekV41Metadata
 
 
 @dataclass(frozen=True)
 class DeepseekV41LayerMetadata:
     """All metadata consumed by one V4.1 attention layer invocation."""
 
+    attention: DeepseekV41Metadata | None
     swa: DeepseekV41Metadata
-    long_kv: DeepseekV41Metadata | None
-    index_k: DeepseekV41Metadata | None
-    compressor_state: DeepseekV41Metadata | None
+    compressor: DeepseekV41CompressorMetadata | None
+    indexer: DeepseekV41IndexerMetadata | None
 
     @property
     def positions(self) -> torch.Tensor:
@@ -77,6 +124,87 @@ def compressed_slot_mapping(slot_mapping: torch.Tensor, ratio: int) -> torch.Ten
         raise ValueError("V4.1 only supports ratio 1 or 2")
     valid = (slot_mapping >= 0) & ((slot_mapping + 1) % ratio == 0)
     return torch.where(valid, slot_mapping // ratio, -1)
+
+
+def _cache_coordinates(common: Any, ratio: int, compressed: bool):
+    """Build original/cache coordinate views without inspecting model state."""
+    query_start_loc = common.query_start_loc[: common.num_reqs + 1]
+    seq_lens = common.seq_lens[: common.num_reqs]
+    query_lens = query_start_loc[1:] - query_start_loc[:-1]
+    start_pos = seq_lens - query_lens
+    plane_ratio = ratio if compressed else 1
+    cache_seq_lens = torch.div(seq_lens, plane_ratio, rounding_mode="floor")
+    cache_start_pos = torch.div(start_pos, plane_ratio, rounding_mode="floor")
+    cache_query_lens = cache_seq_lens - cache_start_pos
+    cache_query_start_loc = torch.cat(
+        (cache_query_lens.new_zeros(1), cache_query_lens.cumsum(0))
+    )
+    query_start_loc_cpu = getattr(common, "query_start_loc_cpu", None)
+    seq_lens_cpu = getattr(common, "seq_lens_cpu", None)
+    if seq_lens_cpu is None:
+        seq_lens_cpu = getattr(common, "_seq_lens_cpu", None)
+    num_cache_tokens = 0
+    max_cache_seq_len = 0
+    if query_start_loc_cpu is not None and seq_lens_cpu is not None:
+        cpu_query_lens = (
+            query_start_loc_cpu[1 : common.num_reqs + 1]
+            - query_start_loc_cpu[: common.num_reqs]
+        )
+        cpu_seq_lens = seq_lens_cpu[: common.num_reqs]
+        cpu_start_pos = cpu_seq_lens - cpu_query_lens
+        cpu_cache_seq_lens = torch.div(
+            cpu_seq_lens, plane_ratio, rounding_mode="floor"
+        )
+        cpu_cache_start_pos = torch.div(
+            cpu_start_pos, plane_ratio, rounding_mode="floor"
+        )
+        num_cache_tokens = int(
+            (cpu_cache_seq_lens - cpu_cache_start_pos).sum().item()
+        )
+        max_cache_seq_len = int(cpu_cache_seq_lens.max().item()) if common.num_reqs else 0
+    elif not compressed:
+        # Production always supplies CPU mirrors. This keeps lightweight unit
+        # fixtures useful without introducing a device-to-host synchronization.
+        num_cache_tokens = int(getattr(common, "num_actual_tokens", 0))
+        max_cache_seq_len = int(getattr(common, "max_seq_len", 0))
+
+    return dict(
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        query_start_loc_cpu=query_start_loc_cpu,
+        seq_lens_cpu=seq_lens_cpu,
+        query_lens=query_lens,
+        start_pos=start_pos,
+        cache_seq_lens=cache_seq_lens,
+        cache_query_lens=cache_query_lens,
+        cache_query_start_loc=cache_query_start_loc,
+        cache_start_pos=cache_start_pos,
+        num_cache_tokens=num_cache_tokens,
+        max_cache_seq_len=max_cache_seq_len,
+    )
+
+
+def _request_counts(common: Any, num_reqs: int):
+    """Return V4-shaped request counters without synchronizing the NPU."""
+    is_prefilling = getattr(common, "is_prefilling", None)
+    query_start_loc_cpu = getattr(common, "query_start_loc_cpu", None)
+    if (
+        is_prefilling is None
+        or query_start_loc_cpu is None
+        or getattr(is_prefilling, "device", None) is None
+        or is_prefilling.device.type != "cpu"
+    ):
+        return 0, 0, 0, 0
+    flags = is_prefilling[:num_reqs].bool()
+    query_lens_cpu = (
+        query_start_loc_cpu[1 : num_reqs + 1]
+        - query_start_loc_cpu[:num_reqs]
+    )
+    num_prefills = int(flags.sum().item())
+    num_decodes = num_reqs - num_prefills
+    num_prefill_tokens = int(query_lens_cpu[flags].sum().item())
+    num_decode_tokens = int(query_lens_cpu[~flags].sum().item())
+    return num_decodes, num_decode_tokens, num_prefills, num_prefill_tokens
 
 
 def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
@@ -182,7 +310,7 @@ def small_op_attention(
         )
         compressed = None
         if source_cache is not None:
-            compressed_len = seq_len // compress_ratio
+            compressed_len = int(source_metadata.cache_seq_lens[req_idx])
             compressed = paged_prefix(
                 source_cache,
                 source_metadata.block_table[req_idx],
@@ -257,10 +385,18 @@ class DeepseekV41EagerAttentionImpl:
         except KeyError as exc:
             raise RuntimeError(f"Missing V4.1 cache metadata for {exc.args[0]}") from exc
         return DeepseekV41LayerMetadata(
+            attention=long_kv,
             swa=swa,
-            long_kv=long_kv,
-            index_k=index_k,
-            compressor_state=compressor_state,
+            compressor=(
+                DeepseekV41CompressorMetadata(long_kv, compressor_state)
+                if self.role.is_kv_source and long_kv is not None
+                else None
+            ),
+            indexer=(
+                DeepseekV41IndexerMetadata(index_k)
+                if index_k is not None
+                else None
+            ),
         )
 
     @staticmethod
@@ -288,14 +424,16 @@ class DeepseekV41EagerAttentionImpl:
 
     def _write_compressed_source(self, attn, hidden_states, positions, metadata):
         compressor = attn.compressor
-        if compressor is None or metadata.long_kv is None or metadata.index_k is None:
+        if compressor is None or metadata.compressor is None or metadata.indexer is None:
             raise RuntimeError("V4.1 KV source is missing compressor or source metadata")
+        compressor_metadata = metadata.compressor
+        indexer_metadata = metadata.indexer
         ratio = self.role.compress_ratio
         if ratio == 1:
             latent = compressor(hidden_states, 0)
             completed = torch.ones_like(positions, dtype=torch.bool)
         else:
-            if metadata.compressor_state is None:
+            if compressor_metadata.state is None:
                 raise RuntimeError("V4.1 ratio-2 source is missing compressor-state metadata")
             state_cache = compressor.state_cache.kv_cache[0].squeeze(-2)
             kv = compressor.wkv(hidden_states.float())
@@ -303,11 +441,13 @@ class DeepseekV41EagerAttentionImpl:
             state_rows = torch.cat((kv, score), -1)
             scatter_cache(
                 compressor.state_cache.kv_cache[0],
-                metadata.compressor_state.slot_mapping,
+                compressor_metadata.state.slot_mapping,
                 state_rows,
             )
             completed = positions.remainder(ratio) == ratio - 1
-            completed_slots = metadata.compressor_state.slot_mapping[: positions.shape[0]][completed].long()
+            completed_slots = compressor_metadata.state.slot_mapping[
+                : positions.shape[0]
+            ][completed].long()
             current = gather_cache_rows(state_cache, completed_slots)
             previous = gather_cache_rows(state_cache, completed_slots - 1)
             pair = torch.stack((previous, current), 1)
@@ -327,7 +467,7 @@ class DeepseekV41EagerAttentionImpl:
             raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
             latent,
-            metadata.index_k.slot_mapping[: positions.shape[0]][completed],
+            indexer_metadata.cache.slot_mapping[: positions.shape[0]][completed],
             source_cos,
             source_sin,
         )
@@ -341,7 +481,7 @@ class DeepseekV41EagerAttentionImpl:
         )
         scatter_cache(
             attn.long_kv_cache.kv_cache[0],
-            metadata.long_kv.slot_mapping[: positions.shape[0]][completed],
+            compressor_metadata.cache.slot_mapping[: positions.shape[0]][completed],
             latent.squeeze(1),
         )
 
@@ -355,7 +495,7 @@ class DeepseekV41EagerAttentionImpl:
             if shared.topk_indices is None:
                 raise RuntimeError("V4.1 sparse consumer ran before its index source")
             return shared.topk_indices
-        if attn.indexer is None or metadata.index_k is None:
+        if attn.indexer is None or metadata.indexer is None:
             raise RuntimeError("V4.1 index source is missing indexer metadata")
 
         context = get_forward_context().no_compile_layers
@@ -367,7 +507,7 @@ class DeepseekV41EagerAttentionImpl:
             cos,
             sin,
             source_layer.kv_cache[0],
-            metadata.index_k,
+            metadata.indexer.cache,
             is_candidate_source=self.role.is_candidate_source,
             uses_candidate_filter=self.role.uses_candidate_filter,
             candidate_topk_blocks=self.topology.candidate_topk_blocks,
@@ -390,7 +530,7 @@ class DeepseekV41EagerAttentionImpl:
             attn.dsa_attn.swa_cache_layer.kv_cache[0],
             metadata.swa,
             source_cache=source_cache,
-            source_metadata=metadata.long_kv,
+            source_metadata=metadata.attention,
             compress_ratio=self.role.compress_ratio,
             window_size=attn.window_size,
             index_topk=self.topology.index_topk,
@@ -454,31 +594,54 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
 
         # SWA and compressor state are addressed in original-token coordinates.
         # Long KV and index K are addressed in completed compression groups.
+        compressed = cache_kind in {"long_kv", "index_k"}
         slots = (
             common.slot_mapping
             if cache_kind in {"swa", "compressor_state"}
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
+        coordinates = _cache_coordinates(common, ratio, compressed)
         positions = getattr(common, "positions", None)
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
             positions = positions[: common.num_input_tokens].long()
             cos, sin = get_cos_and_sin_dsa(positions)
+        num_reqs = int(getattr(common, "num_reqs", common.seq_lens.shape[0]))
+        (
+            num_decodes,
+            num_decode_tokens,
+            num_prefills,
+            num_prefill_tokens,
+        ) = _request_counts(common, num_reqs)
+        text_config = self.vllm_config.model_config.hf_text_config
+        window_size = int(getattr(text_config, "sliding_window", 0))
         return DeepseekV41Metadata(
-            common.block_table_tensor,
-            common.query_start_loc,
-            common.seq_lens,
-            slots,
-            ratio,
-            spec.storage_block_size,
-            is_compressor_state,
+            block_table=common.block_table_tensor[:num_reqs],
+            slot_mapping=slots,
+            compress_ratio=ratio,
+            storage_block_size=spec.storage_block_size,
+            is_compressor_state=is_compressor_state,
             cache_kind=cache_kind,
             positions=positions,
             cos=cos,
             sin=sin,
             num_actual_tokens=int(getattr(common, "num_actual_tokens", slots.shape[0])),
             num_input_tokens=int(getattr(common, "num_input_tokens", slots.shape[0])),
-            num_reqs=int(getattr(common, "num_reqs", common.seq_lens.shape[0])),
+            num_reqs=num_reqs,
+            num_actual_reqs=num_reqs,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_prefill_tokens=num_prefill_tokens,
+            logical_block_size=spec.block_size,
+            max_query_len=int(getattr(common, "max_query_len", 0)),
+            max_seq_len=int(getattr(common, "max_seq_len", 0)),
+            attn_state=getattr(common, "attn_state", None),
+            is_prefilling=getattr(common, "is_prefilling", None),
+            causal=getattr(common, "causal", True),
+            ori_win_left=max(0, window_size - 1),
+            ori_win_right=0,
+            **coordinates,
         )
 
 

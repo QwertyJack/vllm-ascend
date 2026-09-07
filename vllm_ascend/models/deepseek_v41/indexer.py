@@ -137,11 +137,11 @@ class DeepseekV41Indexer(nn.Module):
         weights = weights.float() * (self.softmax_scale * self.n_heads**-0.5)
 
         starts = source_metadata.query_start_loc.tolist()
-        seq_lens = source_metadata.seq_lens.tolist()
+        cache_seq_lens = source_metadata.cache_seq_lens.tolist()
         selected_per_request = []
         next_candidates = [] if is_candidate_source else candidates
         for req_idx, (q_start, q_end) in enumerate(zip(starts[:-1], starts[1:])):
-            compressed_len = int(seq_lens[req_idx]) // self.compress_ratio
+            compressed_len = int(cache_seq_lens[req_idx])
             if compressed_len == 0:
                 selected_per_request.append(
                     torch.empty(
