@@ -4,7 +4,25 @@
 
 import torch
 
-from vllm_ascend.ops.rope_dsv4 import RopeDataProxy
+from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding, RopeDataProxy
+
+
+def test_zero_original_length_disables_yarn():
+    dim = 8
+    base = 10000
+    actual = ComplexExpRotaryEmbedding.precompute_freqs_cis(
+        dim,
+        seqlen=65536,
+        original_seq_len=0,
+        base=base,
+        factor=16,
+        beta_fast=32,
+        beta_slow=1,
+    )
+    expected = 1.0 / (
+        base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
+    )
+    torch.testing.assert_close(actual, expected)
 
 # ──────────────────────────────────────────────
 # Equivalence: pad_to + slice  vs  pad-positions + gather + slice

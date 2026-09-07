@@ -194,9 +194,11 @@ class ComplexExpRotaryEmbedding(nn.Module):
         self.rotary_dim = rotary_dim
         beta_fast = extra_kwargs.get("beta_fast", 32)
         beta_slow = extra_kwargs.get("beta_slow", 1)
+        original_seq_len = extra_kwargs.get("original_seq_len", max_position_embeddings)
         config_key = (
             f"rotary_dim{rotary_dim}_max_position_embeddings{max_position_embeddings}_"
-            f"base{base}_scaling_factor{scaling_factor}_beta_fast{beta_fast}_beta_slow{beta_slow}"
+            f"original_seq_len{original_seq_len}_base{base}_scaling_factor{scaling_factor}_"
+            f"beta_fast{beta_fast}_beta_slow{beta_slow}"
         )
         _ROPE_STATE.layer_info[layername] = (config_key, rope_groups)
 
@@ -207,7 +209,7 @@ class ComplexExpRotaryEmbedding(nn.Module):
 
         if config_key not in _ROPE_STATE.full_rope_cache:
             inv_freq = self.precompute_freqs_cis(
-                rotary_dim, max_position_embeddings, max_position_embeddings, base, scaling_factor, beta_fast, beta_slow
+                rotary_dim, max_position_embeddings, original_seq_len, base, scaling_factor, beta_fast, beta_slow
             )
             t = torch.arange(
                 max_position_embeddings * scaling_factor,
@@ -288,6 +290,8 @@ class ComplexExpRotaryEmbedding(nn.Module):
 
         pos_freqs = base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim)
         inv_freq_extrapolation = 1.0 / pos_freqs
+        if original_seq_len <= 0:
+            return inv_freq_extrapolation
         inv_freq_interpolation = 1.0 / (factor * pos_freqs)
 
         low, high = yarn_find_correction_range(

@@ -7,15 +7,12 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-from vllm.forward_context import get_forward_context
 from vllm.distributed import get_pp_group
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheBackend,
     DeepseekV41CacheLayer,
-    gather_cache_rows,
-    scatter_cache,
-    small_op_attention,
+    DeepseekV41EagerAttentionImpl,
 )
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
@@ -300,22 +297,25 @@ class DeepseekV41Attention(DeepseekV4Attention):
             )
         finally:
             config.compress_ratios = original_ratios
-        if role.has_long_context:
-            from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
+        from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 
-            self.rotary_emb = ComplexExpRotaryEmbedding(
-                vllm_config=vllm_config,
-                layername=f"{prefix}.attn",
-                head_size=self.rope_head_dim,
-                rotary_dim=self.rope_head_dim,
-                max_position_embeddings=max_position_embeddings,
-                is_neox_style=False,
-                scaling_factor=config.rope_parameters["factor"],
-                base=config.compress_rope_theta,
-                beta_fast=config.rope_parameters["beta_fast"],
-                beta_slow=config.rope_parameters["beta_slow"],
-                rope_groups=["default"],
-            )
+        # V4.1 applies YaRN only to layers carrying long-context compressed KV.
+        # Pure SWA layers use the unscaled base RoPE even though the allocated
+        # lookup table still spans the configured maximum context length.
+        self.rotary_emb = ComplexExpRotaryEmbedding(
+            vllm_config=vllm_config,
+            layername=f"{prefix}.attn",
+            head_size=self.rope_head_dim,
+            rotary_dim=self.rope_head_dim,
+            max_position_embeddings=max_position_embeddings,
+            is_neox_style=False,
+            scaling_factor=config.rope_parameters["factor"],
+            base=(config.compress_rope_theta if role.has_long_context else config.rope_theta),
+            beta_fast=config.rope_parameters["beta_fast"],
+            beta_slow=config.rope_parameters["beta_slow"],
+            original_seq_len=(max_position_embeddings if role.has_long_context else 0),
+            rope_groups=["default"],
+        )
         block_size = vllm_config.cache_config.block_size
         if block_size <= 0 or block_size % 2:
             raise ValueError("V4.1 logical block_size must be a positive multiple of two")
@@ -367,179 +367,16 @@ class DeepseekV41Attention(DeepseekV4Attention):
         self.long_kv_source_prefix = f"{source}.long_kv_cache" if role.has_long_context else None
         self.index_k_source_prefix = f"{source}.indexer.k_cache" if role.has_long_context else None
         self.index_source_layer = role.index_source_layer
-
-    def _project_q_kv(self, hidden_states, positions):
-        q_a = self.wq_a(hidden_states)
-        qr = self.q_norm(q_a)
-        q = self.wq_b(qr).unflatten(-1, (self.n_local_heads, self.head_dim))
-        kv = self.kv_norm(self.wkv(hidden_states))
-
-        # Use the same registered RoPE cache as V4's small-op path.  V4.1's
-        # compressed-theta registration replaces this once the source ratio
-        # is nonzero; both Q and the local KV use that theta by design.
-        from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
-
-        cos, sin = get_cos_and_sin_dsa(positions)
-        cos = cos[self.rotary_emb.layername]
-        sin = sin[self.rotary_emb.layername]
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            q.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        kv = kv.view(-1, 1, self.head_dim)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            kv.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        return q.to(hidden_states.dtype), qr, kv.squeeze(1), cos, sin
-
-    def _write_compressed_source(self, hidden_states, positions, metadata):
-        assert self.compressor is not None
-        ratio = self.role.compress_ratio
-        if ratio == 1:
-            latent = self.compressor(hidden_states, 0)
-            completed = torch.ones_like(positions, dtype=torch.bool)
-        else:
-            state_meta = metadata[self.compressor.state_cache.prefix]
-            state_cache = self.compressor.state_cache.kv_cache[0].squeeze(-2)
-            kv = self.compressor.wkv(hidden_states.float())
-            score = self.compressor.wgate(hidden_states.float())
-            state_rows = torch.cat((kv, score), -1)
-            scatter_cache(
-                self.compressor.state_cache.kv_cache[0],
-                state_meta.slot_mapping,
-                state_rows,
-            )
-            completed = positions.remainder(ratio) == ratio - 1
-            completed_slots = state_meta.slot_mapping[: positions.shape[0]][completed].long()
-            current = gather_cache_rows(state_cache, completed_slots)
-            previous = gather_cache_rows(state_cache, completed_slots - 1)
-            pair = torch.stack((previous, current), 1)
-            latent = (
-                pair[..., : self.head_dim]
-                * pair[..., self.head_dim :].softmax(1)
-            ).sum(1)
-            latent = self.compressor.norm(latent.to(hidden_states.dtype))
-        if latent.shape[0] == 0:
-            return
-
-        source_meta = metadata[self.long_kv_cache.prefix]
-        source_positions = positions[completed] + 1 - ratio
-        from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
-
-        cos, sin = get_cos_and_sin_dsa(source_positions)
-        cos = cos[self.rotary_emb.layername]
-        sin = sin[self.rotary_emb.layername]
-        assert self.indexer is not None
-        index_meta = metadata[self.indexer.k_cache.prefix]
-        self.indexer.update_keys(
-            latent,
-            index_meta.slot_mapping[: positions.shape[0]][completed],
-            cos,
-            sin,
-        )
-        latent = latent.view(-1, 1, self.head_dim)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            latent.unsqueeze(1),
-            cos,
-            sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        scatter_cache(
-            self.long_kv_cache.kv_cache[0],
-            source_meta.slot_mapping[: positions.shape[0]][completed],
-            latent.squeeze(1),
-        )
-
-    def _select_sparse_indices(self, hidden_states, qr, positions, cos, sin, metadata):
-        if not self.role.has_long_context:
-            return None
-        if self.shared_state is None:
-            raise RuntimeError("V4.1 shared attention state is not initialized")
-        if not self.role.is_index_source:
-            if self.shared_state.topk_indices is None:
-                raise RuntimeError("V4.1 sparse consumer ran before its index source")
-            return self.shared_state.topk_indices
-
-        assert self.indexer is not None
-        context = get_forward_context().no_compile_layers
-        source_layer = context[self.index_k_source_prefix]
-        selected, candidates = self.indexer.select(
-            hidden_states,
-            qr,
-            positions,
-            cos,
-            sin,
-            source_layer.kv_cache[0],
-            metadata[self.index_k_source_prefix],
-            is_candidate_source=self.role.is_candidate_source,
-            uses_candidate_filter=self.role.uses_candidate_filter,
-            candidate_topk_blocks=self.topology.candidate_topk_blocks,
-            candidate_block_size=self.topology.candidate_block_size,
-            candidates=self.shared_state.candidates,
-        )
-        self.shared_state.topk_indices = selected
-        self.shared_state.candidates = candidates
-        return selected
-
-    def _small_op_attention(self, q, positions, metadata, compressed_indices):
-        swa_layer = self.dsa_attn.swa_cache_layer
-        swa_meta = metadata[swa_layer.prefix]
-        swa_cache = swa_layer.kv_cache[0]
-        source_meta = None
-        source_cache = None
-        if self.role.has_long_context:
-            context = get_forward_context().no_compile_layers
-            source_layer = context[self.long_kv_source_prefix]
-            source_meta = metadata[self.long_kv_source_prefix]
-            source_cache = source_layer.kv_cache[0]
-
-        return small_op_attention(
-            q,
-            positions,
-            swa_cache,
-            swa_meta,
-            source_cache=source_cache,
-            source_metadata=source_meta,
-            compress_ratio=self.role.compress_ratio,
-            window_size=self.window_size,
-            index_topk=self.topology.index_topk,
-            compressed_indices=compressed_indices,
-            sinks=self.attn_sink,
-            softmax_scale=self.softmax_scale,
+        self.v41_impl = DeepseekV41EagerAttentionImpl(
+            prefix=prefix,
+            role=role,
+            topology=topology,
+            long_kv_source_prefix=self.long_kv_source_prefix,
+            index_k_source_prefix=self.index_k_source_prefix,
         )
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        forward_context = get_forward_context()
-        metadata = forward_context.attn_metadata
-        if metadata is None:
-            return torch.zeros_like(hidden_states)
-        q, qr, kv, cos, sin = self._project_q_kv(hidden_states, positions)
-        swa_layer = self.dsa_attn.swa_cache_layer
-        scatter_cache(swa_layer.kv_cache[0], metadata[swa_layer.prefix].slot_mapping, kv)
-        if self.role.is_kv_source:
-            self._write_compressed_source(hidden_states, positions, metadata)
-        compressed_indices = self._select_sparse_indices(
-            hidden_states, qr, positions, cos, sin, metadata
-        )
-        o = self._small_op_attention(q, positions, metadata, compressed_indices)
-        torch.ops._C_ascend.inplace_partial_rotary_mul(
-            o.unsqueeze(1),
-            cos,
-            -sin,
-            rotary_mode="interleave",
-            partial_slice=[self.nope_head_dim, self.head_dim],
-        )
-        output = torch.empty_like(hidden_states)
-        self.dsa_attn.dsa_attn.impl._forward_o_proj(o, output)
-        return output
+        return self.v41_impl.forward(self, positions, hidden_states)
 
 
 

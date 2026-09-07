@@ -1,16 +1,31 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""V4.1 cache metadata. Sparse-attention execution is a separate next step."""
+"""DeepSeek V4.1 DSA metadata and correctness-first eager execution.
+
+The model file owns the network topology and projection modules.  This module
+owns the attention execution boundary: it gathers every cache plane's metadata
+before running the unfused compressor, indexer and sparse-attention reference
+path.  A future fused AscendC implementation can therefore replace the small
+operators here without moving cache or scheduler knowledge back into the model.
+"""
 
 from dataclasses import dataclass
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata, AttentionMetadataBuilder
 
-from vllm_ascend.core.deepseek_v41 import DeepseekV41CompressorStateSpec
+from vllm_ascend.core.deepseek_v41 import (
+    DeepseekV41CompressorStateSpec,
+    DeepseekV41FullSpec,
+    DeepseekV41IndexerSpec,
+    DeepseekV41SWASpec,
+)
+from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
 
 
 @dataclass
@@ -22,6 +37,34 @@ class DeepseekV41Metadata(AttentionMetadata):
     compress_ratio: int
     storage_block_size: int
     is_compressor_state: bool
+    cache_kind: str = "unknown"
+    positions: torch.Tensor | None = None
+    cos: Any = None
+    sin: Any = None
+    num_actual_tokens: int = 0
+    num_input_tokens: int = 0
+    num_reqs: int = 0
+
+
+@dataclass(frozen=True)
+class DeepseekV41LayerMetadata:
+    """All metadata consumed by one V4.1 attention layer invocation."""
+
+    swa: DeepseekV41Metadata
+    long_kv: DeepseekV41Metadata | None
+    index_k: DeepseekV41Metadata | None
+    compressor_state: DeepseekV41Metadata | None
+
+    @property
+    def positions(self) -> torch.Tensor:
+        if self.swa.positions is None:
+            raise RuntimeError("V4.1 SWA metadata does not contain input positions")
+        return self.swa.positions
+
+    def rope(self, layer_name: str, num_tokens: int):
+        if self.swa.cos is None or self.swa.sin is None:
+            raise RuntimeError("V4.1 SWA metadata does not contain RoPE tensors")
+        return self.swa.cos[layer_name][:num_tokens], self.swa.sin[layer_name][:num_tokens]
 
 
 def compressed_slot_mapping(slot_mapping: torch.Tensor, ratio: int) -> torch.Tensor:
@@ -170,6 +213,223 @@ def small_op_attention(
     return torch.stack(outputs).to(q.dtype)
 
 
+class DeepseekV41EagerAttentionImpl:
+    """V4-shaped execution boundary backed by correctness-first small ops.
+
+    Projection, compressor and indexer modules remain registered by the model,
+    while this object resolves the complete per-layer metadata bundle and owns
+    their invocation order.  That is the same separation used by ``dsa_v1``:
+    model construction is independent from cache-aware attention execution.
+    """
+
+    def __init__(self, prefix, role, topology, long_kv_source_prefix, index_k_source_prefix):
+        self.prefix = prefix
+        self.layer_name = f"{prefix}.attn"
+        self.role = role
+        self.topology = topology
+        self.swa_prefix = f"{prefix}.swa_cache"
+        self.long_kv_source_prefix = long_kv_source_prefix
+        self.index_k_source_prefix = index_k_source_prefix
+        self.compressor_state_prefix = (
+            f"{prefix}.compressor.state_cache"
+            if role.is_kv_source and role.compress_ratio == 2
+            else None
+        )
+
+    def _get_layer_metadata(self, metadata) -> DeepseekV41LayerMetadata:
+        try:
+            swa = metadata[self.swa_prefix]
+            long_kv = (
+                metadata[self.long_kv_source_prefix]
+                if self.long_kv_source_prefix is not None
+                else None
+            )
+            index_k = (
+                metadata[self.index_k_source_prefix]
+                if self.index_k_source_prefix is not None
+                else None
+            )
+            compressor_state = (
+                metadata[self.compressor_state_prefix]
+                if self.compressor_state_prefix is not None
+                else None
+            )
+        except KeyError as exc:
+            raise RuntimeError(f"Missing V4.1 cache metadata for {exc.args[0]}") from exc
+        return DeepseekV41LayerMetadata(
+            swa=swa,
+            long_kv=long_kv,
+            index_k=index_k,
+            compressor_state=compressor_state,
+        )
+
+    @staticmethod
+    def _project_q_kv(attn, hidden_states, cos, sin):
+        q_a = attn.wq_a(hidden_states)
+        qr = attn.q_norm(q_a)
+        q = attn.wq_b(qr).unflatten(-1, (attn.n_local_heads, attn.head_dim))
+        kv = attn.kv_norm(attn.wkv(hidden_states))
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            q.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        )
+        kv = kv.view(-1, 1, attn.head_dim)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            kv.unsqueeze(1),
+            cos,
+            sin,
+            rotary_mode="interleave",
+            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        )
+        return q.to(hidden_states.dtype), qr, kv.squeeze(1)
+
+    def _write_compressed_source(self, attn, hidden_states, positions, metadata):
+        compressor = attn.compressor
+        if compressor is None or metadata.long_kv is None or metadata.index_k is None:
+            raise RuntimeError("V4.1 KV source is missing compressor or source metadata")
+        ratio = self.role.compress_ratio
+        if ratio == 1:
+            latent = compressor(hidden_states, 0)
+            completed = torch.ones_like(positions, dtype=torch.bool)
+        else:
+            if metadata.compressor_state is None:
+                raise RuntimeError("V4.1 ratio-2 source is missing compressor-state metadata")
+            state_cache = compressor.state_cache.kv_cache[0].squeeze(-2)
+            kv = compressor.wkv(hidden_states.float())
+            score = compressor.wgate(hidden_states.float())
+            state_rows = torch.cat((kv, score), -1)
+            scatter_cache(
+                compressor.state_cache.kv_cache[0],
+                metadata.compressor_state.slot_mapping,
+                state_rows,
+            )
+            completed = positions.remainder(ratio) == ratio - 1
+            completed_slots = metadata.compressor_state.slot_mapping[: positions.shape[0]][completed].long()
+            current = gather_cache_rows(state_cache, completed_slots)
+            previous = gather_cache_rows(state_cache, completed_slots - 1)
+            pair = torch.stack((previous, current), 1)
+            latent = (
+                pair[..., : attn.head_dim]
+                * pair[..., attn.head_dim :].softmax(1)
+            ).sum(1)
+            latent = compressor.norm(latent.to(hidden_states.dtype))
+        if latent.shape[0] == 0:
+            return
+
+        source_positions = positions[completed] + 1 - ratio
+        source_cos, source_sin = get_cos_and_sin_dsa(source_positions)
+        source_cos = source_cos[attn.rotary_emb.layername]
+        source_sin = source_sin[attn.rotary_emb.layername]
+        if attn.indexer is None:
+            raise RuntimeError("V4.1 KV source is missing its indexer")
+        attn.indexer.update_keys(
+            latent,
+            metadata.index_k.slot_mapping[: positions.shape[0]][completed],
+            source_cos,
+            source_sin,
+        )
+        latent = latent.view(-1, 1, attn.head_dim)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            latent.unsqueeze(1),
+            source_cos,
+            source_sin,
+            rotary_mode="interleave",
+            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        )
+        scatter_cache(
+            attn.long_kv_cache.kv_cache[0],
+            metadata.long_kv.slot_mapping[: positions.shape[0]][completed],
+            latent.squeeze(1),
+        )
+
+    def _select_sparse_indices(self, attn, hidden_states, qr, positions, cos, sin, metadata):
+        if not self.role.has_long_context:
+            return None
+        shared = attn.shared_state
+        if shared is None:
+            raise RuntimeError("V4.1 shared attention state is not initialized")
+        if not self.role.is_index_source:
+            if shared.topk_indices is None:
+                raise RuntimeError("V4.1 sparse consumer ran before its index source")
+            return shared.topk_indices
+        if attn.indexer is None or metadata.index_k is None:
+            raise RuntimeError("V4.1 index source is missing indexer metadata")
+
+        context = get_forward_context().no_compile_layers
+        source_layer = context[self.index_k_source_prefix]
+        selected, candidates = attn.indexer.select(
+            hidden_states,
+            qr,
+            positions,
+            cos,
+            sin,
+            source_layer.kv_cache[0],
+            metadata.index_k,
+            is_candidate_source=self.role.is_candidate_source,
+            uses_candidate_filter=self.role.uses_candidate_filter,
+            candidate_topk_blocks=self.topology.candidate_topk_blocks,
+            candidate_block_size=self.topology.candidate_block_size,
+            candidates=shared.candidates,
+        )
+        shared.topk_indices = selected
+        shared.candidates = candidates
+        return selected
+
+    def _attention(self, attn, q, positions, metadata, compressed_indices):
+        source_cache = None
+        if self.role.has_long_context:
+            source_cache = get_forward_context().no_compile_layers[
+                self.long_kv_source_prefix
+            ].kv_cache[0]
+        return small_op_attention(
+            q,
+            positions,
+            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            metadata.swa,
+            source_cache=source_cache,
+            source_metadata=metadata.long_kv,
+            compress_ratio=self.role.compress_ratio,
+            window_size=attn.window_size,
+            index_topk=self.topology.index_topk,
+            compressed_indices=compressed_indices,
+            sinks=attn.attn_sink,
+            softmax_scale=attn.softmax_scale,
+        )
+
+    def forward(self, attn, positions, hidden_states):
+        forward_context = get_forward_context()
+        if forward_context.attn_metadata is None:
+            return torch.zeros_like(hidden_states)
+        metadata = self._get_layer_metadata(forward_context.attn_metadata)
+        positions = metadata.positions[: hidden_states.shape[0]]
+        cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
+        q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
+        scatter_cache(
+            attn.dsa_attn.swa_cache_layer.kv_cache[0],
+            metadata.swa.slot_mapping,
+            kv,
+        )
+        if self.role.is_kv_source:
+            self._write_compressed_source(attn, hidden_states, positions, metadata)
+        compressed_indices = self._select_sparse_indices(
+            attn, hidden_states, qr, positions, cos, sin, metadata
+        )
+        output = self._attention(attn, q, positions, metadata, compressed_indices)
+        torch.ops._C_ascend.inplace_partial_rotary_mul(
+            output.unsqueeze(1),
+            cos,
+            -sin,
+            rotary_mode="interleave",
+            partial_slice=[attn.nope_head_dim, attn.head_dim],
+        )
+        projected = torch.empty_like(hidden_states)
+        attn.dsa_attn.dsa_attn.impl._forward_o_proj(output, projected)
+        return projected
+
+
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
@@ -181,8 +441,29 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
         ratio = getattr(spec, "compress_ratio", 1)
-        # State rows use ordinary SWA token slots, not compressed or circular slots.
-        slots = common.slot_mapping if is_compressor_state else compressed_slot_mapping(common.slot_mapping, ratio)
+        if isinstance(spec, DeepseekV41SWASpec):
+            cache_kind = "swa"
+        elif isinstance(spec, DeepseekV41FullSpec):
+            cache_kind = "long_kv"
+        elif isinstance(spec, DeepseekV41IndexerSpec):
+            cache_kind = "index_k"
+        elif is_compressor_state:
+            cache_kind = "compressor_state"
+        else:
+            raise TypeError(f"Unsupported V4.1 cache spec: {type(spec).__name__}")
+
+        # SWA and compressor state are addressed in original-token coordinates.
+        # Long KV and index K are addressed in completed compression groups.
+        slots = (
+            common.slot_mapping
+            if cache_kind in {"swa", "compressor_state"}
+            else compressed_slot_mapping(common.slot_mapping, ratio)
+        )
+        positions = getattr(common, "positions", None)
+        cos = sin = None
+        if cache_kind == "swa" and positions is not None:
+            positions = positions[: common.num_input_tokens].long()
+            cos, sin = get_cos_and_sin_dsa(positions)
         return DeepseekV41Metadata(
             common.block_table_tensor,
             common.query_start_loc,
@@ -191,6 +472,13 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             ratio,
             spec.storage_block_size,
             is_compressor_state,
+            cache_kind=cache_kind,
+            positions=positions,
+            cos=cos,
+            sin=sin,
+            num_actual_tokens=int(getattr(common, "num_actual_tokens", slots.shape[0])),
+            num_input_tokens=int(getattr(common, "num_input_tokens", slots.shape[0])),
+            num_reqs=int(getattr(common, "num_reqs", common.seq_lens.shape[0])),
         )
 
 
