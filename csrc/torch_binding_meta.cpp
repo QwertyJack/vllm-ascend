@@ -1135,16 +1135,29 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(co
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
+at::Tensor construct_hc_pre_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
+{
+    at::SmallVector<c10::SymInt, 8> pre_size;
+    if (x.dim() == 4) {
+        pre_size = {x.sym_size(0), x.sym_size(1), hc_mult};
+    } else if (x.dim() == 3) {
+        pre_size = {x.sym_size(0), hc_mult};
+    }
+    return at::empty_symint(c10::SymIntArrayRef(pre_size), x.options().dtype(at::kFloat));
+}
+
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_meta(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
-    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+    const c10::optional<at::Tensor>& pre_mix, int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps,
+    double hc_eps)
 {
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
+    at::Tensor pre = construct_hc_pre_pre_output_tensor(x, hc_mult);
 
-    return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag, pre);
 }
 
 void inplace_partial_rotary_mul_meta(

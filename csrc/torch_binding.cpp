@@ -1327,11 +1327,23 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(co
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
 }
 
+at::Tensor construct_hc_pre_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
+{
+    at::SmallVector<int64_t, 8> pre_size;
+    if (x.dim() == 4) {
+        pre_size = {x.size(0), x.size(1), hc_mult};
+    } else if (x.dim() == 3) {
+        pre_size = {x.size(0), hc_mult};
+    }
+    return at::empty(pre_size, x.options().dtype(at::kFloat));
+}
+
 void check_hc_pre_shape_and_dtype(
     const at::Tensor& x,
     const at::Tensor& hc_fn,
     const at::Tensor& hc_scale,
     const at::Tensor& hc_base,
+    const c10::optional<at::Tensor>& pre_mix,
     int64_t hc_mult)
 {
     constexpr int64_t HC_SCALE_SIZE = 3;
@@ -1364,28 +1376,40 @@ void check_hc_pre_shape_and_dtype(
     TORCH_CHECK(hc_fn.dtype() == at::kFloat, "hc_fn's dtype should be FLOAT32.");
     TORCH_CHECK(hc_scale.dtype() == at::kFloat, "hc_scale's dtype should be FLOAT32.");
     TORCH_CHECK(hc_base.dtype() == at::kFloat, "hc_base's dtype should be FLOAT32.");
+    if (pre_mix.has_value() && pre_mix->defined()) {
+        TORCH_CHECK(pre_mix->dtype() == at::kFloat, "pre_mix's dtype should be FLOAT32.");
+        TORCH_CHECK(pre_mix->dim() == x_dims - 1, "pre_mix's dim num should be ", x_dims - 1, ", actual ",
+                    pre_mix->dim(), ".");
+        for (auto i = 0; i < x_dims - 1; i++) {
+            TORCH_CHECK(pre_mix->size(i) == x.size(i), "pre_mix.shape[", i, "] should equal x.shape[", i,
+                        "], actual ", pre_mix->size(i), " vs ", x.size(i), ".");
+        }
+    }
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> run_hc_pre_fusion(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> run_hc_pre_fusion(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
-    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+    const c10::optional<at::Tensor>& pre_mix, int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps,
+    double hc_eps)
 {
     auto output_tensors = construct_hc_pre_output_tensor(x, hc_mult);
     at::Tensor y = std::get<0>(output_tensors);
     at::Tensor post = std::get<1>(output_tensors);
     at::Tensor comb_frag = std::get<2>(output_tensors);
-    EXEC_NPU_CMD(aclnnHcPre, x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, norm_eps,
-                 y, post, comb_frag);
+    at::Tensor pre = construct_hc_pre_pre_output_tensor(x, hc_mult);
+    EXEC_NPU_CMD(aclnnHcPre, x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, hc_sinkhorn_iters, hc_eps, norm_eps,
+                 y, post, comb_frag, pre);
 
-    return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag);
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(y, post, comb_frag, pre);
 }
 
-std::tuple<at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_npu(
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> npu_hc_pre_v2_npu(
     const at::Tensor& x, const at::Tensor& hc_fn, const at::Tensor& hc_scale, const at::Tensor& hc_base,
-    int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps, double hc_eps)
+    const c10::optional<at::Tensor>& pre_mix, int64_t hc_mult, int64_t hc_sinkhorn_iters, double norm_eps,
+    double hc_eps)
 {
-    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, hc_mult);
-    return run_hc_pre_fusion(x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
+    check_hc_pre_shape_and_dtype(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult);
+    return run_hc_pre_fusion(x, hc_fn, hc_scale, hc_base, pre_mix, hc_mult, hc_sinkhorn_iters, norm_eps, hc_eps);
 }
 
 void inplace_partial_rotary_mul_npu(at::Tensor & x, const at::Tensor &r1, const at::Tensor &r2, c10::string_view rotary_mode, at::IntArrayRef partial_slice)
@@ -2521,10 +2545,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
 
     ops.def(
         "npu_hc_pre_v2("
-            "Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, "
-            "int hc_mult, int hc_sinkhorn_iters, "
-            "float norm_eps, float hc_eps"
-        ") -> (Tensor out0, Tensor out1, Tensor out2)"
+            "Tensor x, Tensor hc_fn, Tensor hc_scale, Tensor hc_base, Tensor? pre_mix=None, *, "
+            "int hc_mult=4, int hc_sinkhorn_iters=20, "
+            "float norm_eps=1e-6, float hc_eps=1e-6"
+        ") -> (Tensor y, Tensor post, Tensor comb_frag, Tensor pre)"
         );
     ops.impl("npu_hc_pre_v2", torch::kPrivateUse1, &vllm_ascend::npu_hc_pre_v2_npu);
 
