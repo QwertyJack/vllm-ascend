@@ -2,10 +2,9 @@
 
 import torch
 import torch.nn.functional as F
-import torch_npu
+import torch_npu  # noqa: F401
 
 from vllm_ascend.models.deepseek_v41.model import DeepseekV41DecoderLayer
-
 
 HC_MULT = 4
 HIDDEN_SIZE = 5120
@@ -23,7 +22,7 @@ def _layer() -> DeepseekV41DecoderLayer:
     return layer
 
 
-def _reference(x, hc_fn, hc_scale, hc_base):
+def _reference(x, hc_fn, hc_scale, hc_base, pre_mix):
     x_float = x.float()
     x_flat = x_float.flatten(-2)
     mixes = F.linear(x_flat, hc_fn) * torch.rsqrt(
@@ -39,19 +38,22 @@ def _reference(x, hc_fn, hc_scale, hc_base):
     for _ in range(SINKHORN_ITERS - 1):
         comb = comb / (comb.sum(-1, keepdim=True) + HC_EPS)
         comb = comb / (comb.sum(-2, keepdim=True) + HC_EPS)
-    y = (pre.unsqueeze(-1) * x_float).sum(dim=-2).to(x.dtype)
-    return y, post, comb
+    y = (pre_mix.unsqueeze(-1) * x_float).sum(dim=-2).to(x.dtype)
+    return y, post, comb, pre
 
 
-def test_v41_hc_5120_small_ops_on_npu():
+def test_v41_hc_pre_handoff_5120_on_npu():
     torch.manual_seed(19)
     x = torch.randn(2, HC_MULT, HIDDEN_SIZE, dtype=torch.bfloat16)
     hc_fn = torch.randn(24, HC_MULT * HIDDEN_SIZE, dtype=torch.float32) / HIDDEN_SIZE
     hc_scale = torch.randn(3, dtype=torch.float32)
     hc_base = torch.randn(24, dtype=torch.float32)
-    expected = _reference(x, hc_fn, hc_scale, hc_base)
+    pre_mix = torch.rand(2, HC_MULT, dtype=torch.float32)
+    expected = _reference(x, hc_fn, hc_scale, hc_base, pre_mix)
 
-    actual = _layer().hc_pre(x.npu(), hc_fn.npu(), hc_scale.npu(), hc_base.npu())
+    actual = _layer().hc_pre(
+        x.npu(), hc_fn.npu(), hc_scale.npu(), hc_base.npu(), pre_mix.npu()
+    )
 
     for actual_tensor, expected_tensor in zip(actual, expected):
         torch.testing.assert_close(

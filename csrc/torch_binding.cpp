@@ -1295,8 +1295,6 @@ at::Tensor npu_hc_post_npu(
 }
 
 constexpr int64_t HC_PRE_HC_LIMIT = 4;
-constexpr int64_t HC_PRE_D_LIMIT = 4096;
-constexpr int64_t HC_PRE_D_LIMIT_EXTEND = 7168;
 constexpr int64_t HC_PRE_MIX_HC_LIMIT = 24;
 
 std::tuple<at::Tensor, at::Tensor, at::Tensor> construct_hc_pre_output_tensor(const at::Tensor& x, int64_t hc_mult)
@@ -1358,8 +1356,6 @@ void check_hc_pre_shape_and_dtype(
     auto d = x_dims == 4 ? x.size(3) : x.size(2);
     TORCH_CHECK(hc_mult == HC_PRE_HC_LIMIT, "hc_mult only supports ", HC_PRE_HC_LIMIT, ", actual ", hc_mult, ".");
     TORCH_CHECK(hc == HC_PRE_HC_LIMIT, "The hc of x only supports ", HC_PRE_HC_LIMIT, ", actual ", hc, ".");
-    TORCH_CHECK(d == HC_PRE_D_LIMIT || d == HC_PRE_D_LIMIT_EXTEND, "The d of x only supports ", HC_PRE_D_LIMIT,
-                " or ", HC_PRE_D_LIMIT_EXTEND, ", actual ", d, ".");
     TORCH_CHECK(hc_fn.dim() == 2, "Input tensor hc_fn's dim num should be 2, actual ", hc_fn.dim(), ".");
     TORCH_CHECK(hc_fn.size(0) == HC_PRE_MIX_HC_LIMIT, "The hc_fn.shape[0] only supports ",
                 HC_PRE_MIX_HC_LIMIT, ", actual ", hc_fn.size(0), ".");

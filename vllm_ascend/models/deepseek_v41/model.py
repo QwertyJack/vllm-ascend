@@ -414,14 +414,18 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
     def hc_collapse(x, pre_mix):
         return (pre_mix.unsqueeze(-1) * x.float()).sum(-2).to(x.dtype)
 
-    def hc_pre(self, x, hc_fn, hc_scale, hc_base):
-        """Compatibility helper for direct mHC operator validation.
-
-        Runtime forward uses ``hc_mixes`` plus the previous sublayer's
-        coefficient explicitly; this helper must not be used for that handoff.
-        """
-        pre, post, comb = self.hc_mixes(x, hc_fn, hc_scale, hc_base)
-        return self.hc_collapse(x, pre), post, comb
+    def hc_pre(self, x, hc_fn, hc_scale, hc_base, pre_mix=None):
+        return torch.ops._C_ascend.npu_hc_pre_v2(
+            x,
+            hc_fn,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            hc_mult=self.hc_mult,
+            hc_sinkhorn_iters=self.hc_sinkhorn_iters,
+            norm_eps=self.norm_eps,
+            hc_eps=self.hc_eps,
+        )
 
     def hc_post(self, x, residual, post, comb):
         y = post.unsqueeze(-1) * x.unsqueeze(-2)
@@ -437,18 +441,26 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
         input_ids=None,
     ):
         residual = hidden_states
-        attn_pre, attn_post, attn_comb = self.hc_mixes(
-            hidden_states, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        x, attn_post, attn_comb, attn_pre = self.hc_pre(
+            hidden_states,
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            pre_mix,
         )
-        x = self.input_layernorm(self.hc_collapse(hidden_states, pre_mix))
+        x = self.input_layernorm(x)
         x = self.self_attn(positions, x, llama_4_scaling)
         hidden_states = self.hc_post(x, residual, attn_post, attn_comb)
 
         residual = hidden_states
-        ffn_pre, ffn_post, ffn_comb = self.hc_mixes(
-            hidden_states, self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base
+        x, ffn_post, ffn_comb, ffn_pre = self.hc_pre(
+            hidden_states,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            attn_pre,
         )
-        x = self.post_attention_layernorm(self.hc_collapse(hidden_states, attn_pre))
+        x = self.post_attention_layernorm(x)
         x = self.mlp(x, input_ids)
         hidden_states = self.hc_post(x, residual, ffn_post, ffn_comb)
         return hidden_states, ffn_pre
