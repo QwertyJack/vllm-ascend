@@ -74,3 +74,25 @@ vLLM Ascend 侧另有组网路由单测，验证 ratio 0/1/2 均进入原生 Spa
 arch22 的 TND 压缩长度读取当前直接使用 cu_seqlens_cmp_kv 相邻差值，Metadata 则优先使用 seqused_cmp_kv。对“有效长度小于存储长度”的 TND 输入，这两个口径需要另行统一。本次不改变原有长度接口语义，新增 TND 用例使用二者一致的长度，不将这种带 padding 的有效长度覆盖场景声明为已解决。
 
 CSA 多核调度、G=1/128、非均匀 batch、aclgraph、极端空范围还应在目标平台验收时扩展覆盖。普通模式本次保持现有流水和内存设计，性能结论必须由 profiling 给出。
+
+## 7. 当前仓库的模型编译范围
+
+当前仓库按 Aurora 调用范围裁剪编译模板；前面列出的源库通用能力及其回归矩阵不等于本仓库裁剪后的支持范围。主算子只编译 BF16、TND Q、PA_BBND KV、SWA/CSA。BSND、非分页 KV、HCA 和两个独立 ori sparse 模板不再编译；host 会拒绝这些未编译的布局、模式或 dtype。
+
+| 构建目标 | 裁剪前 key 数 | 当前 key 数 | 保留的硬件特化 |
+| --- | --- | --- | --- |
+| A2/A3 | 320 | 6 | CSA 的 `HEAD_RATIO_ONE=0/1`，`SPLIT_G=IS_VEC_S2PHYADDR=0` |
+| A5 | 320 | 12 | `HEAD_RATIO_ONE=0`，保留 split-G 和 CSA 物理地址向量化 |
+| Host | 320 | 14 | 两个设备集合的并集，仅用于 key 编码及校验 |
+
+两个设备集合共有 4 个 key，共用部分分别编译。A2/A3 不编译 A5 专用标志组合；A5 不编译 A2/A3 的单头专用模板。确定性级别仍进入 host key，因此两边都保留 `BATCH_CONSISTENCY=0/1`。`FLASH_DECODE` 固定为 0，decode 调度由 metadata 驱动。模板声明的参数顺序、位宽和取值不变，保留的 key 编码不变。
+
+`DeepseekV41EagerAttentionImpl._native_attention` 的 C0 走 SWA，C1/C2 走 CSA；cache spec 固定 BF16，query 与 KV 需要同 dtype。压缩比例、TopK 和请求长度都是运行时参数。编译保留全部本地 head 数边界，包括 TP 后只剩一个 query head 的 CSA。
+
+无需 CANN 的矩阵回归：
+
+```bash
+python3 -m unittest discover -s tests/ut/ops -p test_aurora_tiling_keys.py -v
+```
+
+该检查枚举实际头文件的预处理结果，覆盖两种架构、模型调用布局、C0/C1/C2、单头和确定性边界，并检查 key 声明不变。它不执行 CANN 编译或 NPU kernel。key 数不包含 dtype 对编译任务数的影响，也不能直接换算整包编译耗时；耗时及数值结果需在配套 CANN/NPU 环境中重编译后验证。

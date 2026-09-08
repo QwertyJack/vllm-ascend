@@ -1155,6 +1155,17 @@ ge::graphStatus SMLAInfoParser::Parse(SMLATilingInfo &smlaInfo)
         return ge::GRAPH_FAILED;
     }
 
+    // Match the model-facing template selection on both A2/A3 and A5.
+    OP_CHECK_IF(qLayout_ != SMLALayout::TND || kvLayout_ != SMLALayout::PA_BBND,
+                OP_LOGE(opName_, "Aurora SparseFlashMla only compiles TND Q with PA_BBND KV."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(perfMode_ != SMLATemplateMode::SWA_TEMPLATE_MODE &&
+                    perfMode_ != SMLATemplateMode::CSA_TEMPLATE_MODE,
+                OP_LOGE(opName_, "Aurora SparseFlashMla only compiles SWA and CSA templates."),
+                return ge::GRAPH_FAILED);
+    OP_CHECK_IF(qType_ != ge::DT_BF16,
+                OP_LOGE(opName_, "Aurora SparseFlashMla only compiles BF16 Q/KV."), return ge::GRAPH_FAILED);
+
     SetSMLAShape();
     if (ge::GRAPH_SUCCESS != GetN1Size() || ge::GRAPH_SUCCESS != GetN2Size() || ge::GRAPH_SUCCESS != GetGSize() ||
         ge::GRAPH_SUCCESS != GetBatchSize() || ge::GRAPH_SUCCESS != GetQTSize() || ge::GRAPH_SUCCESS != GetS1Size() ||

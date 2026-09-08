@@ -20,19 +20,20 @@ class SparseFlashMla : public OpDef {
 public:
     explicit SparseFlashMla(const char *name) : OpDef(name)
     {
+        // Aurora stores both SWA and compressed KV in BF16.
         this->Input("q")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .DataType({ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
             .AutoContiguous();
         this->Input("ori_kv")
             .ParamType(OPTIONAL)
-            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .DataType({ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
             .IgnoreContiguous();
         this->Input("cmp_kv")
             .ParamType(OPTIONAL)
-            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .DataType({ge::DT_BF16})
             .FormatList({ge::FORMAT_ND})
             .IgnoreContiguous();
         this->Input("ori_sparse_indices")
@@ -112,7 +113,7 @@ public:
             .AutoContiguous();
         this->Output("attn_out")
             .ParamType(REQUIRED)
-            .DataType({ge::DT_FLOAT16, ge::DT_BF16})
+            .DataType({ge::DT_BF16})
             .FormatList({ge::FORMAT_ND});
         this->Output("softmax_lse")
             .ParamType(OPTIONAL)

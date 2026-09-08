@@ -56,32 +56,34 @@ __global__ __aicore__ void compressor(
     REGISTER_TILING_DEFAULT(optiling::CompressorTilingData);
     KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_MIX_AIC_1_2);
     GET_TILING_DATA_WITH_STRUCT(optiling::CompressorTilingData, tilingDataIn, tiling);
+    // Discard the computation branch during template instantiation for empty input.
     if constexpr (static_cast<TEMPLATE_ID>(TemplateId) == TEMPLATE_ID::EMPTY_X) {
         return;
-    }
-    const optiling::CompressorTilingData *__restrict tilingData = &tilingDataIn;
-    TPipe pipe;
-    constexpr auto xLayout = static_cast<X_LAYOUT>(XLayout);
-    constexpr auto xDtype = static_cast<X_DTYPE>(XDType);
+    } else {
+        const optiling::CompressorTilingData *__restrict tilingData = &tilingDataIn;
+        TPipe pipe;
+        constexpr auto xLayout = static_cast<X_LAYOUT>(XLayout);
+        constexpr auto xDtype = static_cast<X_DTYPE>(XDType);
 #if (__CCE_AICORE__ == 220)
-    constexpr auto ropeDtype = static_cast<ROPE_DTYPE>(RopeDType);
+        constexpr auto ropeDtype = static_cast<ROPE_DTYPE>(RopeDType);
 #endif
-    constexpr auto coff = static_cast<COFF>(Coff);
-    constexpr auto rotaryMode = static_cast<ROTARY_MODE>(RotaryMode);
+        constexpr auto coff = static_cast<COFF>(Coff);
+        constexpr auto rotaryMode = static_cast<ROTARY_MODE>(RotaryMode);
 #if (__CCE_AICORE__ != 220)
-    constexpr auto cacheMode = static_cast<CACHE_MODE>(CacheMode);
+        constexpr auto cacheMode = static_cast<CACHE_MODE>(CacheMode);
 #endif
 #if (__CCE_AICORE__ == 220)
-    if constexpr (static_cast<TEMPLATE_ID>(TemplateId) == TEMPLATE_ID::PERF) {
-        INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernelPerf, xLayout, xDtype, ropeDtype, coff, rotaryMode);
-    } else {
-        INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernel, xLayout, xDtype, ropeDtype, coff, rotaryMode);
-    }
+        if constexpr (static_cast<TEMPLATE_ID>(TemplateId) == TEMPLATE_ID::PERF) {
+            INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernelPerf, xLayout, xDtype, ropeDtype, coff, rotaryMode);
+        } else {
+            INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernel, xLayout, xDtype, ropeDtype, coff, rotaryMode);
+        }
 #else
-    if constexpr (static_cast<TEMPLATE_ID>(TemplateId) == TEMPLATE_ID::FULL_LOAD) {
-        INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernelFullLoad, xLayout, xDtype, coff, rotaryMode, cacheMode);
-    } else {
-        INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernel, xLayout, xDtype, coff, rotaryMode, cacheMode);
-    }
+        if constexpr (static_cast<TEMPLATE_ID>(TemplateId) == TEMPLATE_ID::FULL_LOAD) {
+            INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernelFullLoad, xLayout, xDtype, coff, rotaryMode, cacheMode);
+        } else {
+            INVOKE_COMPRESSOR_GENERAL_OP_IMPL(CompressorKernel, xLayout, xDtype, coff, rotaryMode, cacheMode);
+        }
 #endif
+    }
 }
