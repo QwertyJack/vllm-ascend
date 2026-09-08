@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Correctness-first V4.1 Indexer and two-level sparse selection."""
+"""V4.1 index projections, quantized QLI and cross-layer candidate selection."""
 
 import torch
 from torch import nn
@@ -8,10 +8,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
-    paged_prefix,
     scatter_cache,
-    select_candidate_blocks,
-    select_index_topk,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
 
@@ -65,9 +62,7 @@ class DeepseekV41Indexer(nn.Module):
                 bias=False,
                 dtype=torch.bfloat16,
             )
-            self.k_norm = DeepseekV41RMSNorm(
-                self.width, _read(config, "rms_norm_eps")
-            )
+            self.k_norm = DeepseekV41RMSNorm(self.width, _read(config, "rms_norm_eps"))
             self.k_cache = DeepseekV41CacheLayer(
                 vllm_config,
                 f"{prefix}.k_cache",
@@ -123,9 +118,7 @@ class DeepseekV41Indexer(nn.Module):
         candidates,
     ):
         """Score index K, optionally filter blocks, then return position TopK."""
-        query = self._output(self.wq_b, qr).unflatten(
-            -1, (self.n_heads, self.width)
-        )
+        query = self._output(self.wq_b, qr).unflatten(-1, (self.n_heads, self.width))
         torch.ops._C_ascend.inplace_partial_rotary_mul(
             query.unsqueeze(1),
             cos,
@@ -136,88 +129,122 @@ class DeepseekV41Indexer(nn.Module):
         weights = self._output(self.weights_proj, hidden_states)
         weights = weights.float() * (self.softmax_scale * self.n_heads**-0.5)
 
-        starts = source_metadata.query_start_loc.tolist()
-        cache_seq_lens = source_metadata.cache_seq_lens.tolist()
-        selected_per_request = []
-        next_candidates = [] if is_candidate_source else candidates
-        for req_idx, (q_start, q_end) in enumerate(zip(starts[:-1], starts[1:])):
-            compressed_len = int(cache_seq_lens[req_idx])
-            if compressed_len == 0:
-                selected_per_request.append(
-                    torch.empty(
-                        (q_end - q_start, 0),
-                        dtype=torch.int32,
-                        device=query.device,
-                    )
-                )
-                if is_candidate_source:
-                    next_candidates.append(
-                        torch.empty(
-                            (q_end - q_start, 0),
-                            dtype=torch.bool,
-                            device=query.device,
-                        )
-                    )
-                continue
-
-            k_cache, scale_cache = source_cache
-            key = paged_prefix(
-                k_cache,
-                source_metadata.block_table[req_idx],
-                compressed_len,
-                source_metadata.storage_block_size,
-            )
-            key_scale = paged_prefix(
-                scale_cache,
-                source_metadata.block_table[req_idx],
-                compressed_len,
-                source_metadata.storage_block_size,
-            )
-            key = key.float() * key_scale.float()
-            score = torch.einsum(
-                "qhd,kd->qhk",
-                query[q_start:q_end].float(),
-                key.float(),
-            )
-            score = (score.relu_() * weights[q_start:q_end].unsqueeze(-1)).sum(1)
-            visible = (
-                (positions[q_start:q_end].long() + 1) // self.compress_ratio
-            ).clamp_max(compressed_len).unsqueeze(-1)
-            score.masked_fill_(
-                torch.arange(compressed_len, device=score.device) >= visible,
-                -torch.inf,
-            )
-
-            if is_candidate_source:
-                candidate = select_candidate_blocks(
-                    score,
-                    visible,
-                    candidate_topk_blocks,
-                    candidate_block_size,
-                )
-                next_candidates.append(candidate)
-            elif uses_candidate_filter:
-                if candidates is None:
-                    raise RuntimeError(
-                        "V4.1 candidate-filtering indexer ran before its source"
-                    )
-                score.masked_fill_(~candidates[req_idx], -torch.inf)
-
-            selected_per_request.append(
-                select_index_topk(score, visible, self.index_topk)
-            )
-
-        max_topk = max((item.shape[-1] for item in selected_per_request), default=0)
-        padded = []
-        for item in selected_per_request:
-            if item.shape[-1] < max_topk:
-                item = torch.nn.functional.pad(
-                    item, (0, max_topk - item.shape[-1]), value=-1
-                )
-            padded.append(item)
-        result = (
-            torch.cat(padded, 0)
-            if padded
-            else torch.empty((0, 0), dtype=torch.int32, device=query.device)
+        return self.select_projected(
+            query,
+            weights,
+            positions,
+            source_cache,
+            source_metadata,
+            is_candidate_source=is_candidate_source,
+            uses_candidate_filter=uses_candidate_filter,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+            candidates=candidates,
         )
-        return result, next_candidates
+
+    def select_projected(
+        self,
+        query,
+        weights,
+        positions,
+        source_cache,
+        source_metadata,
+        *,
+        is_candidate_source,
+        uses_candidate_filter,
+        candidate_topk_blocks,
+        candidate_block_size,
+        candidates,
+    ):
+        """Run QLI V2 on paged INT8 K; candidates are block IDs, not positions.
+
+        Source and consumer share [tokens, 1, candidate_topk_blocks] INT32
+        block IDs only within this forward. Query quantization and position
+        ordering stay outside the native QLI/candidate operator.
+        """
+        if is_candidate_source and uses_candidate_filter:
+            raise ValueError("A candidate source must use the unfiltered position TopK")
+        if uses_candidate_filter and candidates is None:
+            raise RuntimeError("V4.1 candidate-filtering indexer ran before its source")
+        if self.width != 128 or self.n_heads not in (32, 64):
+            raise ValueError("A3 QLI requires index_head_dim=128 and 32 or 64 index heads")
+        if not 1 <= self.index_topk <= 2048:
+            raise ValueError("A3 QLI requires index_topk in [1, 2048]")
+        if self.compress_ratio not in (1, 2):
+            raise ValueError("Aurora QLI supports compression ratios 1 and 2")
+        if is_candidate_source or uses_candidate_filter:
+            if not 0 < candidate_topk_blocks <= 2048 or candidate_topk_blocks % 64:
+                raise ValueError("candidate_topk_blocks must be a multiple of 64 in [64, 2048]")
+            if candidate_block_size != 8:
+                raise ValueError("The current A3 candidate kernel requires candidate_block_size=8")
+        candidate_shape = (query.shape[0], 1, candidate_topk_blocks)
+        if uses_candidate_filter and (candidates.shape != candidate_shape or candidates.dtype != torch.int32):
+            raise ValueError("Candidate consumer requires INT32 block IDs with matching query rows")
+        max_key_len = source_metadata.max_cache_seq_len
+        topk = min(self.index_topk, max_key_len)
+        if query.shape[0] == 0 or topk == 0:
+            selected = torch.empty((query.shape[0], 0), dtype=torch.int32, device=query.device)
+            if is_candidate_source:
+                candidates = torch.full(candidate_shape, -1, dtype=torch.int32, device=query.device)
+            return selected, candidates
+
+        # Use a representable FP16 scale, including all-zero query heads.
+        min_fp16_scale = 2.0**-24
+        query_scale = (query.float().abs().amax(-1) / 127.0).to(torch.float16).clamp_min_(min_fp16_scale)
+        quantized_query = (query.float() / query_scale.float().unsqueeze(-1)).round().clamp(-127, 127).to(torch.int8)
+        weights = weights.to(torch.float16)
+        key, key_scale = source_cache
+        key_scale = key_scale.squeeze(-1)  # Preserve the Hybrid cache page stride.
+        cu_seqlens_q = source_metadata.query_start_loc.to(torch.int32)
+        seqused_k = source_metadata.cache_seq_lens.to(torch.int32)
+        residual = (
+            source_metadata.seq_lens.remainder(self.compress_ratio).to(torch.int32)
+            if self.compress_ratio != 1
+            else None
+        )
+        common = dict(
+            cu_seqlens_q=cu_seqlens_q,
+            seqused_k=seqused_k,
+            cmp_residual_k=residual,
+            max_seqlen_q=source_metadata.max_query_len,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            mask_mode=3,
+            cmp_ratio=self.compress_ratio,
+        )
+        op_metadata = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+            self.n_heads,
+            1,
+            self.width,
+            topk,
+            2,
+            batch_size=cu_seqlens_q.shape[0] - 1,
+            max_seqlen_k=max_key_len,
+            **common,
+        )
+        mode = 1 if is_candidate_source else 2 if uses_candidate_filter else 3
+        selected, _, candidate_out = torch.ops._C_ascend.npu_quant_lightning_indexer_v2(
+            quantized_query,
+            key,
+            weights,
+            query_scale,
+            key_scale,
+            topk,
+            2,
+            block_table=source_metadata.block_table,
+            metadata=op_metadata,
+            candidate_topk_index=candidates if uses_candidate_filter else None,
+            candidate_mode=mode,
+            candidate_topk_blocks=candidate_topk_blocks,
+            candidate_block_size=candidate_block_size,
+            **common,
+        )
+        selected = selected.squeeze(1)
+        visible = ((positions + 1) // self.compress_ratio).unsqueeze(-1)
+        valid = (selected >= 0) & (selected < visible)
+        # Native TopK is score-ordered. Attention consumes chronological positions
+        # with invalid slots at the end, as in the previous small-op path.
+        sentinel = torch.iinfo(torch.int32).max
+        selected = torch.where(valid, selected, sentinel).sort(dim=-1).values
+        selected = torch.where(selected == sentinel, -1, selected)
+        return selected, candidate_out if is_candidate_source else candidates

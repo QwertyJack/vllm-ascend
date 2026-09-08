@@ -41,6 +41,7 @@
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/sparse_flash_mla/sparse_flash_mla_torch_adpt.h"
+#include "attention/quant_lightning_indexer_v2/quant_lightning_indexer_v2_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
 #include "moe/causal_conv1d_v310/causal_conv1d_310_torch_adpt.h"
@@ -2245,6 +2246,31 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "                           bool return_softmax_lse=False) -> (Tensor attention_out, Tensor softmax_max, Tensor softmax_sum)"
     );
     ops.impl("npu_sparse_flash_attention", torch::kPrivateUse1, &vllm_ascend::npu_sparse_flash_attention);
+
+    ops.def(
+        "npu_quant_lightning_indexer_v2_metadata(int num_heads_q, int num_heads_k, int head_dim, int topk, "
+        "int quant_mode, *, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, Tensor? seqused_q=None, "
+        "Tensor? seqused_k=None, Tensor? cmp_residual_k=None, int batch_size=0, int max_seqlen_q=0, "
+        "int max_seqlen_k=0, str layout_q='TND', str layout_k='PA_BBND', int mask_mode=3, int cmp_ratio=1) -> Tensor"
+    );
+    ops.impl("npu_quant_lightning_indexer_v2_metadata", torch::kPrivateUse1,
+             &vllm_ascend::qli_v2::QuantLightningIndexerMetadata);
+    ops.impl("npu_quant_lightning_indexer_v2_metadata", torch::kMeta,
+             &vllm_ascend::qli_v2::QuantLightningIndexerMetadata);
+    ops.def(
+        "npu_quant_lightning_indexer_v2(Tensor query, Tensor key, Tensor weights, "
+        "Tensor query_dequant_scale, Tensor key_dequant_scale, int topk, int quant_mode, *, "
+        "Tensor? candidate_topk_index=None, Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_k=None, "
+        "Tensor? seqused_q=None, Tensor? seqused_k=None, Tensor? cmp_residual_k=None, "
+        "Tensor? block_table=None, Tensor? output_idx_offset=None, Tensor? metadata=None, "
+        "int max_seqlen_q=-1, str layout_q='TND', str layout_k='PA_BBND', int mask_mode=3, "
+        "int cmp_ratio=1, int candidate_mode=3, int candidate_topk_blocks=2048, "
+        "int candidate_block_size=8) -> (Tensor, Tensor, Tensor)"
+    );
+    ops.impl("npu_quant_lightning_indexer_v2", torch::kPrivateUse1,
+             &vllm_ascend::qli_v2::QuantLightningIndexerCandidate);
+    ops.impl("npu_quant_lightning_indexer_v2", torch::kMeta,
+             &vllm_ascend::qli_v2::QuantLightningIndexerCandidate);
 
     ops.def(
         "npu_sparse_flash_mla_metadata(int num_heads_q, int num_heads_kv, int head_dim, *, "
