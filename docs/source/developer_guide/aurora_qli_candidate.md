@@ -19,7 +19,8 @@ whole context into a dense tensor.
 
 Metadata receives original query boundaries, compressed K lengths, and the
 original sequence length modulo the compression ratio. The residual tensor
-must be absent for ratio 1. BSND callers must omit `cu_seqlens_q`.
+must be absent for ratio 1. This repository compiles the model's TND/PA_BBND
+layout only; BSND and nonpaged calls are rejected by host validation.
 
 The three candidate modes share one native operator:
 
@@ -47,7 +48,7 @@ raises an error.
 - Aurora compression ratios 1 and 2, causal mask mode 3.
 - Position TopK in `[1, 2048]`; candidate blocks a multiple of 64 in `[64, 2048]`.
 - Candidate block size is exactly 8 in this kernel implementation.
-- TND and BSND operator layouts; model integration uses TND.
+- TND query and PA_BBND key layouts only in the compiled package.
 - The A3 operator returns indices and candidate IDs, not score values.
 
 The numerical reference follows the supplied INT8 golden: INT32 QK divided by
@@ -86,3 +87,58 @@ was used with `/v1/completions`; the checkpoint does not provide a standard
 chat template. Repeated output agreement validates these fixed functional
 cases, not a baseline-versus-candidate dataset accuracy comparison. Graph,
 64K/128K requests, multi-node execution, Engram and DSpark remain unvalidated.
+
+## Compilation scope
+
+The model always uses INT8 Q/K, FP16 weights/scales and quant mode 2. The
+compiled QLI V2 template matrix therefore has one key on both A2/A3 and A5,
+down from 4 and 16 respectively. The template argument declarations retain
+their original order and values so the retained key encoding stays stable.
+The A5 operator definition also drops unused FP8/FP4 dtype combinations;
+the A5 kernel entry directly instantiates the INT8 implementation rather than
+instantiating every quantization variant behind runtime branches.
+
+Candidate modes 1/2/3, compression ratio, TopK and sequence lengths remain
+runtime parameters. The A2/A3 candidate implementation and the A5 implementation
+remain in separate architecture branches. This pruning does not add A5 candidate
+support or change which operators the default A5 package builds: QLI V2 and
+SparseFlashMla are currently included by the A2/A3 package lists. Explicit A5
+builds of these operators use the A5 template selections.
+
+SparseFlashMla is likewise restricted to the model's BF16 TND/PA_BBND SWA/CSA
+calls. It compiles 6 keys on A2/A3 and 12 on A5; shared keys remain on both,
+while single-head CSA specialization is A2/A3-only and split-G/vectorized
+addressing is A5-only. HCA, independent original-KV sparse templates, other
+layouts and FP16 are excluded on both architectures. Host validation rejects
+pruned contracts before kernel lookup. See the operator's
+[compilation matrix](../../../csrc/attention/sparse_flash_mla/docs/ratio2_a2a3.md#7-当前仓库的模型编译范围).
+HcPre already isolates A2/A3 key 0 from A5 keys 1000/1001; both A5 paths can
+be selected by runtime token counts, so neither is removed.
+
+The fused Compressor serves DeepSeek V4; V4.1 currently uses small operators
+for compression. Compressor already selects four keys per architecture:
+TH/BF16, interleaved RoPE, continuous cache, and `coff=1/2`, with FP32 RoPE.
+A2/A3 selects EMPTY_X/PERF; A5 selects NORMAL/EMPTY_X. The two `coff` values
+cover V4 compression ratios 128 and 4 respectively, and empty input remains
+supported. A5 FULL_LOAD requires BSH, so it is already excluded. Host and kernel
+sources are selected separately for arch32 (A2/A3) and arch35 (A5).
+
+Compressor dtype registration now matches those existing selections: one
+signature per architecture, down from four on A2/A3 and two on A5. Norm weights
+remain BF16 on A2/A3 and FP32 on A5. Host validation likewise rejects uncompiled
+layouts, dtypes and modes. The empty-input entry uses a discarded `else` branch
+so the compiler does not instantiate a computation kernel after an unconditional
+return. The four keys themselves and their encodings remain unchanged.
+
+The CPU-only template regression can be run without importing torch or CANN:
+
+```bash
+python3 -m unittest discover -s tests/ut/ops -p test_aurora_tiling_keys.py -v
+```
+
+This checks preprocessor selections, architecture isolation, model layout
+calls, dtype registration and unchanged argument encodings. It also compiles
+the real Compressor entry against stubs that reject unwanted template
+instantiations, including any computation for EMPTY_X. It does not measure CANN build time
+or execute NPU kernels. Rebuild the operator package before the numerical
+regressions; retained key counts alone do not establish a wall-clock speedup.

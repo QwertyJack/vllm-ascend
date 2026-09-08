@@ -159,11 +159,11 @@ def _invoke(data, layout, ratio, mode, *, candidates=None, blocks=64, mask=3, re
     return output, candidate_out
 
 
-@pytest.mark.parametrize("layout", ["TND", "BSND"])
 @pytest.mark.parametrize("ratio", [1, 2])
 @pytest.mark.parametrize("length", [7, 513, 1025])
 @pytest.mark.parametrize("mode", [1, 2, 3])
-def test_native_qli_candidate(layout, ratio, length, mode):
+def test_native_qli_candidate(ratio, length, mode):
+    layout = "TND"
     data = _data(length)
     score, visible = _scores(*data[:5], ratio, ratio - 1)
     candidate_in = None
@@ -183,6 +183,12 @@ def test_native_qli_candidate(layout, ratio, length, mode):
         _check_candidates(score, visible, candidates, 64)
     else:
         assert candidates.numel() == 0
+
+
+def test_native_qli_rejects_uncompiled_query_layout():
+    # Fail in host validation instead of looking up a pruned BSND binary.
+    with pytest.raises(RuntimeError):
+        _invoke(_data(513), "BSND", 1, 3)
 
 
 @pytest.mark.parametrize(
