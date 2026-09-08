@@ -50,9 +50,10 @@ ge::graphStatus SparseCompressionChecker::CheckTopkLength(const CheckContext &co
 ge::graphStatus SparseCompressionChecker::CheckSinglePara(const CheckContext &context) const
 {
     OP_CHECK_IF(
-        context.cmpRatio < 1 || context.cmpRatio > 128,
+        context.cmpRatio < 0 || context.cmpRatio > 128 || (context.cmpKv.present && context.cmpRatio == 0),
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(Op(context), "cmp_ratio", std::to_string(context.cmpRatio).c_str(),
-                                              "Cmp_ratio must be in range [1, 128]"),
+                                              "Cmp_ratio must be 0 or 1 when cmp_kv is absent, or in range [1, 128] "
+                                              "when cmp_kv is present"),
         return ge::GRAPH_FAILED);
     OP_CHECK_IF(
         context.topkValueMode != 1,
@@ -95,9 +96,9 @@ ge::graphStatus SparseCompressionChecker::CheckParaExistence(const CheckContext 
             OP_LOGE_FOR_INVALID_ARGUMENT_WITH_REASON(Op(context), "seqused_cmp_kv", "Seqused_cmp_kv requires cmp_kv"),
             return ge::GRAPH_FAILED);
         OP_CHECK_IF(
-            context.cmpRatio != 1,
+            context.cmpRatio != 0 && context.cmpRatio != 1,
             OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(Op(context), "cmp_ratio", std::to_string(context.cmpRatio).c_str(),
-                                                  "Cmp_ratio must be 1 when cmp_kv is absent"),
+                                                  "Cmp_ratio must be 0 or 1 when cmp_kv is absent"),
             return ge::GRAPH_FAILED);
     }
 

@@ -83,7 +83,7 @@ struct CheckContext {
     int64_t quantMode = 0;
     int64_t ropeHeadDim = 0;
     float softmaxScale = 1.0F;
-    int64_t cmpRatio = 1;
+    int64_t cmpRatio = 0;
     int64_t oriMaskMode = 0;
     int64_t cmpMaskMode = 0;
     int64_t oriWinLeft = -1;

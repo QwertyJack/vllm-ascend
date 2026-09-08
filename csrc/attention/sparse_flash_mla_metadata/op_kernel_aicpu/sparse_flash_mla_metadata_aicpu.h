@@ -344,7 +344,7 @@ private:
     int32_t headDim_ = 0;
     int32_t oriTopK_ = 0;
     int32_t cmpTopK_ = 0;
-    int32_t cmpRatio_ = 1;
+    int32_t cmpRatio_ = 0;
     int32_t oriMaskMode_ = static_cast<int32_t>(SparseMode::BAND);
     int32_t cmpMaskMode_ = static_cast<int32_t>(SparseMode::RIGHT_DOWN_CAUSAL);
     int64_t oriWinLeft_ = 127;

@@ -245,7 +245,7 @@ public:
     uint32_t cmpKeyStride0 = 0; // A5
 
     float softmaxScale = 0;
-    int64_t cmpRatio = 1;
+    int64_t cmpRatio = 0;
     uint64_t oriMaskMode = 0;
     uint64_t cmpMaskMode = 0;
     uint64_t oriKvStride0 = 0; // A2/A3
@@ -379,7 +379,7 @@ private:
     uint32_t cmpKvHeadDim_ = 0;
 
     uint32_t qTSize_ = 0; // 仅TND时生效
-    int64_t cmpRatio_ = 1;
+    int64_t cmpRatio_ = 0;
     int64_t oriWinLeft_ = 0;
     int64_t oriWinRight_ = 0;
     bool hasOriSparseIndices_ = false;

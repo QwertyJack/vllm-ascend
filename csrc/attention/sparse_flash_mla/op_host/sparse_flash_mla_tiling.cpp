@@ -1660,12 +1660,12 @@ ge::graphStatus SMLATilingCheck::CheckSingleParaCmpRatio() const
 
     switch (smlaInfo_.perfMode) {
         case SMLATemplateMode::CSA_TEMPLATE_MODE:
-            return checkRatio(cmpRatio_ == 2 || cmpRatio_ == 4, "2 or 4", "CSA",
+            return checkRatio(cmpRatio_ == 1 || cmpRatio_ == 2 || cmpRatio_ == 4, "1, 2 or 4", "CSA",
                               "when cmp_sparse_indices is provided");
         case SMLATemplateMode::HCA_TEMPLATE_MODE:
             return checkRatio(cmpRatio_ == 128, "128", "HCA", "when cmp_sparse_indices is not provided");
         default:
-            return checkRatio(cmpRatio_ == 1, "1", "SWA", "when cmp_kv is not provided");
+            return checkRatio(cmpRatio_ == 0, "0", "SWA", "when cmp_kv is not provided");
     }
 }
 

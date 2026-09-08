@@ -4,7 +4,7 @@
 
 建议先读第 1～3 节建立概念，再结合第 4～6 节读 Kernel。接口完整约束见 [README](../README.md) 和 [aclnn 接口说明](aclnnSparseFlashMla.md)。本文区分公开接口约束与内部模板分支；存在模板不代表任意输入组合都能通过校验。
 
-A2/A3 新增倍率 2 的具体改动与验证范围见 [cmp_ratio=2 适配说明](ratio2_a2a3.md)。当前 A2/A3 的 CSA 接受 2/4，HCA 接受 128；cmp causal mask 下倍率不为 1 时必须提供 residual（包括余数为 0 的情况）。
+A2/A3 倍率 1/2 的具体改动与验证范围见 [cmp_ratio=1/2 适配说明](ratio2_a2a3.md)。当前 A2/A3 的 SWA 接受 0，CSA 接受 1/2/4，HCA 接受 128；cmp causal mask 下倍率不为 1 时必须提供 residual（包括余数为 0 的情况）。
 
 ## 1. 算子计算什么
 

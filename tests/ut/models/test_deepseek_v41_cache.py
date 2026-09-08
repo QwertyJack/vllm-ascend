@@ -8,6 +8,7 @@ import torch
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
+    DeepseekV41EagerAttentionImpl,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
     gather_cache_rows,
@@ -240,6 +241,40 @@ def test_compression_slot_mapping():
     slots = torch.tensor([-1, 0, 1, 62, 63, 320, 321, 383])
     assert compressed_slot_mapping(slots, 2).tolist() == [-1, -1, 0, -1, 31, -1, 160, 191]
     assert torch.equal(compressed_slot_mapping(slots, 1), slots)
+
+
+@pytest.mark.parametrize("compress_ratio", [0, 1, 2])
+def test_supported_ratios_route_to_native_sparse_flash_mla(monkeypatch, compress_ratio):
+    impl = DeepseekV41EagerAttentionImpl.__new__(DeepseekV41EagerAttentionImpl)
+    impl.role = SimpleNamespace(
+        compress_ratio=compress_ratio,
+        has_long_context=compress_ratio > 0,
+    )
+    impl.long_kv_source_prefix = "source"
+    impl.topology = SimpleNamespace(index_topk=512)
+    source_cache = object()
+    monkeypatch.setattr(
+        "vllm_ascend.attention.dsa_v41.get_forward_context",
+        lambda: SimpleNamespace(
+            no_compile_layers={"source": SimpleNamespace(kv_cache=[source_cache])}
+        ),
+    )
+    expected = object()
+
+    def native(*args, **kwargs):
+        return expected
+
+    monkeypatch.setattr(impl, "_native_attention", native)
+
+    actual = impl._attention(
+        SimpleNamespace(),
+        object(),
+        object(),
+        SimpleNamespace(swa=object(), attention=object()),
+        object() if compress_ratio else None,
+    )
+
+    assert actual is expected
 
 
 def test_candidate_blocks_pin_partial_tail_and_drop_unreachable_blocks():

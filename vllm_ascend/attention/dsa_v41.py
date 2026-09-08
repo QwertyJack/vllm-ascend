@@ -537,10 +537,9 @@ class DeepseekV41EagerAttentionImpl:
             source_cache = get_forward_context().no_compile_layers[
                 self.long_kv_source_prefix
             ].kv_cache[0]
-        # The supplied A2/A3 kernel implements the V4.1 ratio-2 CSA path and
-        # the SWA-only path. Ratio-1 CSA remains on the correctness fallback
-        # until the operator's host checker and numerical matrix support it.
-        if self.role.compress_ratio in (0, 2):
+        # A2/A3 SparseFlashMla uses ratio 0 for SWA-only and supports the
+        # ratio-1/ratio-2 compressed sparse paths used by this topology.
+        if self.role.compress_ratio in (0, 1, 2):
             return self._native_attention(
                 attn,
                 q,
@@ -584,8 +583,8 @@ class DeepseekV41EagerAttentionImpl:
                 "A2/A3 SparseFlashMla requires the local query-head count to be "
                 f"a power of two in [1, 128], got {attn.n_local_heads}"
             )
-        has_compressed = self.role.compress_ratio == 2
-        ratio = 2 if has_compressed else 1
+        has_compressed = self.role.compress_ratio in (1, 2)
+        ratio = self.role.compress_ratio if has_compressed else 0
         num_reqs = metadata.swa.num_reqs
         query_start_loc = metadata.swa.query_start_loc[: num_reqs + 1].int()
         seq_lens = metadata.swa.seq_lens[:num_reqs].int()
@@ -597,10 +596,10 @@ class DeepseekV41EagerAttentionImpl:
         cmp_topk = 0
         if has_compressed:
             if source_cache is None or metadata.attention is None or compressed_indices is None:
-                raise RuntimeError("V4.1 ratio-2 attention is missing compressed KV or TopK metadata")
+                raise RuntimeError("V4.1 compressed attention is missing KV or TopK metadata")
             cmp_block_table = metadata.attention.block_table[:num_reqs].int()
             cmp_seq_lens = metadata.attention.cache_seq_lens[:num_reqs].int()
-            cmp_residual = seq_lens.remainder(ratio)
+            cmp_residual = seq_lens.remainder(ratio) if ratio != 1 else None
             cmp_topk = self.topology.index_topk
             if cmp_topk not in (512, 1024):
                 raise ValueError(f"SparseFlashMla only supports TopK 512 or 1024, got {cmp_topk}")
