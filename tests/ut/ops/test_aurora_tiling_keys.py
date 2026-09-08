@@ -256,14 +256,28 @@ class AuroraTilingKeysTest(unittest.TestCase):
         self.assertEqual(set(host), a2a3 | a5)
         self.assertEqual(len(host), 14)
 
-    def test_both_architectures_exclude_unused_layouts_modes_and_quantization(self):
+    def test_sparse_mla_scope_and_a2a3_qli_quantization(self):
         for arch in (None, 220, 310):
             with self.subTest(arch=arch):
                 for key in self.matrices["sparse_flash_mla", arch]:
                     self.assertEqual(key[1:3], (1, 2))  # TND / PA_BBND
                     self.assertIn(key[3], (0, 2))  # SWA / CSA
-                # INT8 Q/K, INT32 output, paged attention, TND / PA_BBND.
-                self.assertEqual(self.matrices["quant_lightning_indexer_v2", arch], [(2, 2, 3, 1, 1, 2)])
+                if arch != 310:
+                    # A2/A3: INT8 Q/K, INT32 output, paged attention, TND / PA_BBND.
+                    self.assertEqual(self.matrices["quant_lightning_indexer_v2", arch], [(2, 2, 3, 1, 1, 2)])
+
+    def test_qli_a5_retains_full_dtype_and_layout_matrix(self):
+        # A5's general QLI supports FP8/MXFP8, HiFloat8, MXFP4 and INT8.
+        # FP8 and MXFP8 share a dtype key and dispatch by runtime quant_mode.
+        expected = {
+            (dtype, dtype, 3, paged, q_layout, k_layout)
+            for dtype, (paged, q_layout, k_layout) in itertools.product(
+                (36, 34, 40, 2), ((1, 0, 2), (1, 1, 2), (0, 0, 0), (0, 1, 1))
+            )
+        }
+        selected = self.matrices["quant_lightning_indexer_v2", 310]
+        self.assertEqual(set(selected), expected)
+        self.assertEqual(len(selected), 16)
 
     def test_model_call_sites_use_the_compiled_layouts(self):
         # Inspect real call sites so adding a model layout requires updating

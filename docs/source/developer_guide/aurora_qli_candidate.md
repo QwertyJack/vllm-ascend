@@ -19,8 +19,9 @@ whole context into a dense tensor.
 
 Metadata receives original query boundaries, compressed K lengths, and the
 original sequence length modulo the compression ratio. The residual tensor
-must be absent for ratio 1. This repository compiles the model's TND/PA_BBND
-layout only; BSND and nonpaged calls are rejected by host validation.
+must be absent for ratio 1. On A2/A3, this repository compiles the model's
+TND/PA_BBND layout only; BSND and nonpaged calls are rejected by host validation.
+A5 retains its general QLI dtype, layout and quantization support.
 
 The three candidate modes share one native operator:
 
@@ -90,13 +91,13 @@ cases, not a baseline-versus-candidate dataset accuracy comparison. Graph,
 
 ## Compilation scope
 
-The model always uses INT8 Q/K, FP16 weights/scales and quant mode 2. The
-compiled QLI V2 template matrix therefore has one key on both A2/A3 and A5,
-down from 4 and 16 respectively. The template argument declarations retain
-their original order and values so the retained key encoding stays stable.
-The A5 operator definition also drops unused FP8/FP4 dtype combinations;
-the A5 kernel entry directly instantiates the INT8 implementation rather than
-instantiating every quantization variant behind runtime branches.
+Aurora's A2/A3 path uses INT8 Q/K, FP16 weights/scales and quant mode 2. Its
+compiled QLI V2 template matrix has one key, down from 4. A5 retains the full
+16-key matrix, including paged BSND/TND queries and matching nonpaged BSND/TND
+layouts. A5 dtype registration, host validation and kernel dispatch retain
+FP8, MXFP8, HiFloat8, MXFP4 and INT8 (quant modes 1/3/4/5/2 respectively).
+The Aurora INT8 call sites do not establish that other A5 paths are unused.
+Both architectures retain their original template argument encodings.
 
 Candidate modes 1/2/3, compression ratio, TopK and sequence lengths remain
 runtime parameters. The A2/A3 candidate implementation and the A5 implementation
