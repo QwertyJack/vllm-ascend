@@ -8,7 +8,7 @@ import torch
 import torch.nn.functional as F
 import torch_npu  # noqa: F401
 
-from vllm_ascend.utils import enable_custom_op
+from vllm_ascend.utils import enable_custom_op, is_950
 
 enable_custom_op()
 
@@ -185,7 +185,8 @@ def test_native_qli_candidate(ratio, length, mode):
         assert candidates.numel() == 0
 
 
-def test_native_qli_rejects_uncompiled_query_layout():
+@pytest.mark.skipif(is_950(), reason="A5 QLI retains BSND query support")
+def test_native_qli_a2a3_rejects_uncompiled_query_layout():
     # Fail in host validation instead of looking up a pruned BSND binary.
     with pytest.raises(RuntimeError):
         _invoke(_data(513), "BSND", 1, 3)

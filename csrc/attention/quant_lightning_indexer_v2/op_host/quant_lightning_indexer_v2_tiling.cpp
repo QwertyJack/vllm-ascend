@@ -331,8 +331,18 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
     std::string layout_key(opParamInfo_.layOutKey);
     std::string layout_query(opParamInfo_.layOutQuery);
 
-    OP_CHECK_IF(layout_query != "TND" || layout_key != "PA_BBND",
-                OP_LOGE(opName_, "Aurora QLI only compiles TND Q with PA_BBND K."), return ge::GRAPH_FAILED);
+    if (npuArch_ == NpuArch::DAV_2201) {
+        OP_CHECK_IF(layout_query != "TND" || layout_key != "PA_BBND",
+                    OP_LOGE(opName_, "A2/A3 Aurora QLI only compiles TND Q with PA_BBND K."),
+                    return ge::GRAPH_FAILED);
+    } else if (npuArch_ == NpuArch::DAV_3510) {
+        OP_CHECK_IF(
+            ((std::string(opParamInfo_.layOutKey) != "PA_BBND") && (std::string(opParamInfo_.layOutKey) != "BSND") &&
+             (std::string(opParamInfo_.layOutKey) != "TND")),
+            OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "layout_k", std::string(opParamInfo_.layOutKey).c_str(),
+                                                  "Layout_k only supports PA_BBND, BSND or TND"),
+            return ge::GRAPH_FAILED);
+    }
 
     if (npuArch_ == NpuArch::DAV_2201) {
         OP_CHECK_IF(!((*opParamInfo_.sparseCount > 0) && (*opParamInfo_.sparseCount <= SPARSE_LIMIT)),
@@ -374,8 +384,19 @@ ge::graphStatus QLIV2InfoParser::CheckAttrParaInfo()
         OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "sparse_mode", std::to_string(*opParamInfo_.sparseMode).c_str(),
                                               "Sparse_mode only supports 0 or 3"),
         return ge::GRAPH_FAILED);
-    OP_CHECK_IF(*opParamInfo_.quantMode != QUANT_MODE_INT8,
-                OP_LOGE(opName_, "Aurora QLI only compiles INT8 quant_mode 2."), return ge::GRAPH_FAILED);
+    if (npuArch_ == NpuArch::DAV_2201) {
+        OP_CHECK_IF(*opParamInfo_.quantMode != 2, OP_LOGE(opName_, "input attr quant_mode only supported 2."),
+                    return ge::GRAPH_FAILED);
+    } else if (npuArch_ == NpuArch::DAV_3510) {
+        OP_CHECK_IF((*opParamInfo_.quantMode != QUANT_MODE_FP8) && (*opParamInfo_.quantMode != QUANT_MODE_INT8) &&
+                        (*opParamInfo_.quantMode != QUANT_MODE_MXFP8) &&
+                        (*opParamInfo_.quantMode != QUANT_MODE_HIFLOAT8) &&
+                        (*opParamInfo_.quantMode != QUANT_MODE_MXFP4),
+                    OP_LOGE_FOR_INVALID_VALUE_WITH_REASON(opName_, "sparse_mode",
+                                                          std::to_string(*opParamInfo_.quantMode).c_str(),
+                                                          "Quant_mode only supports 1, 2, 3, 4 and 5"),
+                    return ge::GRAPH_FAILED);
+    }
 
     if (npuArch_ == NpuArch::DAV_2201) {
         OP_CHECK_IF(*opParamInfo_.returnValue, OP_LOGE(opName_, "input attr returnValue only supported False."),
