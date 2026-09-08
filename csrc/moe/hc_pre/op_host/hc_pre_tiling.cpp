@@ -261,7 +261,6 @@ ge::graphStatus HcPreTiling::CalcMKSplitCoreMembasePart2Tiling()
     tilingData_.set_d(d_);
     tilingData_.set_hcMultAlign(hcMultAlign_);
     tilingData_.set_rowOfFormerBlock(rowOfFormerBlock_);
-    tilingData_.set_rowOfTailBlock(rowOfTailBlock_);
     tilingData_.set_rowLoopOfFormerBlock(rowLoopOfFormerBlock_);
     tilingData_.set_rowLoopOfTailBlock(rowLoopOfTailBlock_);
     tilingData_.set_stage2RowFactor(rowFactor_);

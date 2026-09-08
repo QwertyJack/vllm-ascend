@@ -14,6 +14,7 @@
  */
 
 #include "aclnn_sparse_flash_mla_metadata.h"
+#include "../sparse_flash_mla_metadata_check.h"
 #include "sparse_flash_mla_metadata.h"
 #include "aclnn_kernels/contiguous.h"
 #include "aclnn_kernels/reshape.h"
@@ -28,7 +29,6 @@
 #include "opdev/tensor_view_utils.h"
 #include "opdev/make_op_executor.h"
 #include "acl/acl_rt.h"
-#include "../sparse_flash_mla_metadata_check.h"
 
 constexpr int64_t BATCH_CONSISTENCY_LEVEL = 3;
 
