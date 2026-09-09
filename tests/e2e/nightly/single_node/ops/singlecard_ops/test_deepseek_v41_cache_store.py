@@ -7,10 +7,29 @@ import torch
 import torch_npu  # noqa: F401
 
 from tests.deepseek_v41_cache_utils import allocate_cache_views, make_cache_config
-from vllm_ascend.attention.dsa_v41 import fused_scatter_cache, scatter_cache
+from vllm_ascend.attention.dsa_v41 import scatter_cache, scatter_cache_v2
 from vllm_ascend.utils import enable_custom_op
 
 enable_custom_op()
+
+
+def _slot_mapping_2d(slots, block_size):
+    valid = slots >= 0
+    physical = slots.clamp_min(0)
+    indices = torch.stack(
+        (
+            torch.div(physical, block_size, rounding_mode="floor"),
+            physical.remainder(block_size),
+        ),
+        dim=-1,
+    ).to(torch.int32)
+    indices[~valid] = -1
+    return indices
+
+
+def _reference_scatter(cache, slots, values):
+    valid = slots >= 0
+    scatter_cache(cache, slots[valid], values[valid])
 
 
 @pytest.mark.parametrize(
@@ -33,8 +52,9 @@ def test_fused_store_matches_reference_in_layer_slots(name, rows, width, dtype):
     )
     values = torch.randn(3, width, dtype=dtype, device="npu")
 
-    scatter_cache(expected[name], slots, values)
-    fused_scatter_cache(actual[name], slots, values)
+    _reference_scatter(expected[name], slots, values)
+    indices = _slot_mapping_2d(slots, rows)
+    scatter_cache_v2(actual[name], indices, values)
     torch.npu.synchronize()
 
     for expected_raw, actual_raw in zip(expected_backing, actual_backing):
@@ -80,15 +100,51 @@ def test_indexer_dynamic_quant_and_fused_store_match_reference(kind):
         atol=1e-8,
     )
 
-    scatter_cache(expected_key, slots, reference_key)
-    scatter_cache(expected_scale, slots, reference_scale.to(torch.float16))
-    fused_scatter_cache(actual_key, slots, actual_quant)
-    fused_scatter_cache(
+    _reference_scatter(expected_key, slots, reference_key)
+    _reference_scatter(expected_scale, slots, reference_scale.to(torch.float16))
+    indices = _slot_mapping_2d(slots, rows)
+    scatter_cache_v2(actual_key, indices, actual_quant)
+    scatter_cache_v2(
         actual_scale,
-        slots,
+        indices,
         actual_quant_scale.unsqueeze(-1).to(torch.float16),
     )
     torch.npu.synchronize()
 
     for expected_raw, actual_raw in zip(expected_backing, actual_backing):
+        torch.testing.assert_close(actual_raw.cpu(), expected_raw.cpu(), rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    "name,plane,width,dtype",
+    [
+        ("model.layers.3.self_attn.swa_cache", None, 512, torch.bfloat16),
+        ("model.layers.2.self_attn.long_kv_cache", None, 512, torch.bfloat16),
+        ("model.layers.20.self_attn.long_kv_cache", None, 512, torch.bfloat16),
+        ("model.layers.2.self_attn.indexer.k_cache", 0, 128, torch.int8),
+        ("model.layers.2.self_attn.indexer.k_cache", 1, 1, torch.float16),
+    ],
+)
+def test_negative_coordinates_do_not_modify_packed_backing(
+    name, plane, width, dtype
+):
+    torch.manual_seed(59)
+    config = make_cache_config(7)
+    backing, caches = allocate_cache_views(config, "npu")
+    cache = caches[name] if plane is None else caches[name][plane]
+    before = [tensor.clone() for tensor in backing]
+    indices = torch.full((3, 2), -1, dtype=torch.int32, device="npu")
+    if dtype == torch.int8:
+        values = torch.randint(-127, 128, (3, width), dtype=dtype, device="npu")
+    else:
+        values = torch.randn(3, width, dtype=dtype, device="npu")
+
+    # The view is packed into a shared allocation: its page stride is larger
+    # than the contiguous stride implied by the visible plane shape.
+    squeezed = cache.squeeze(-2)
+    assert squeezed.stride(0) > squeezed.shape[1] * squeezed.stride(1)
+    scatter_cache_v2(cache, indices, values)
+    torch.npu.synchronize()
+
+    for expected_raw, actual_raw in zip(before, backing):
         torch.testing.assert_close(actual_raw.cpu(), expected_raw.cpu(), rtol=0, atol=0)

@@ -3501,9 +3501,12 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
-        common_v41_metadata: dict[str, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+            # V4.1 cache coordinates are shared only inside one framework KV
+            # cache group. This lets a source's LongKV and Indexer reuse the
+            # same [T, 2] mapping without aliasing any SWA group's mapping.
+            common_v41_metadata: dict[str, Any] = {}
             cm = copy(cm_base)  # shallow copy
             # Basically only the encoder seq_lens, block_table and slot_mapping change
             # for each kv_cache_group.

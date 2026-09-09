@@ -16,10 +16,10 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41EagerAttentionImpl,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
-    fused_scatter_cache,
     gather_cache_rows,
     pad_sparse_indices,
     scatter_cache,
+    scatter_cache_v2,
     select_candidate_blocks,
     select_index_topk,
 )
@@ -382,7 +382,7 @@ def test_scatter_cache_redirects_invalid_rows_to_null_row():
     assert cache[0, 3, 0].tolist() == [7.0, 8.0]
 
 
-def test_fused_scatter_cache_uses_page_coordinates_and_preserves_stride(
+def test_scatter_cache_v2_consumes_prepared_coordinates_and_preserves_stride(
     monkeypatch,
 ):
     backing = torch.zeros(3 * 128, dtype=torch.uint8)
@@ -392,6 +392,7 @@ def test_fused_scatter_cache_uses_page_coordinates_and_preserves_stride(
         stride=(32, 2, 2, 1),
     )
     values = torch.tensor([[9.0, 9.0], [7.0, 8.0]])
+    indices = torch.tensor([[-1, -1], [1, 3]], dtype=torch.int32)
     calls = []
 
     def scatter(var, indices, updates):
@@ -403,14 +404,14 @@ def test_fused_scatter_cache_uses_page_coordinates_and_preserves_stride(
         scatter,
         raising=False,
     )
-    fused_scatter_cache(cache, torch.tensor([-1, 7]), values)
+    scatter_cache_v2(cache, indices, values)
 
-    var, indices, updates = calls[0]
+    var, actual_indices, updates = calls[0]
     assert var.shape == (3, 4, 2)
     assert var.stride() == (32, 2, 1)
-    assert indices.dtype == torch.int32
-    assert indices.tolist() == [[0, 0], [1, 3]]
-    assert updates.tolist() == [[0.0, 0.0], [7.0, 8.0]]
+    assert actual_indices.data_ptr() == indices.data_ptr()
+    torch.testing.assert_close(actual_indices, indices)
+    assert updates.tolist() == [[9.0, 9.0], [7.0, 8.0]]
 
 
 def test_compression_slot_mapping():
@@ -507,6 +508,61 @@ def test_state_metadata_keeps_original_token_slots(config, runtime):
     assert metadata.num_prefill_tokens == 2
 
 
+def test_slot_mapping_is_shared_per_compatible_cache_group(config, runtime):
+    specs = collect_specs(runtime)
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([1, 2, 65, -1]),
+        block_table_tensor=torch.tensor([[5, 7]]),
+        query_start_loc=torch.tensor([0, 4]),
+        query_start_loc_cpu=torch.tensor([0, 4]),
+        seq_lens=torch.tensor([4]),
+        seq_lens_cpu=torch.tensor([4]),
+        num_reqs=1,
+        num_actual_tokens=3,
+        num_input_tokens=4,
+        max_query_len=4,
+        max_seq_len=4,
+        is_prefilling=torch.tensor([True]),
+    )
+    full_group_metadata = {}
+    long_metadata = DeepseekV41MetadataBuilder(
+        specs["model.layers.2.self_attn.long_kv_cache"],
+        ["model.layers.2.self_attn.long_kv_cache"],
+        runtime,
+        torch.device("cpu"),
+    ).build(0, common, common_v41_metadata=full_group_metadata)
+    index_metadata = DeepseekV41MetadataBuilder(
+        specs["model.layers.2.self_attn.indexer.k_cache"],
+        ["model.layers.2.self_attn.indexer.k_cache"],
+        runtime,
+        torch.device("cpu"),
+    ).build(0, common, common_v41_metadata=full_group_metadata)
+
+    assert long_metadata.slot_mapping.data_ptr() == index_metadata.slot_mapping.data_ptr()
+    assert long_metadata.slot_mapping.tolist() == [
+        [0, 0],
+        [-1, -1],
+        [1, 0],
+        [-1, -1],
+    ]
+
+    # The SWA builder receives a different per-group publication dictionary,
+    # so it owns an independent mapping computed from that group's flat slots.
+    swa_metadata = DeepseekV41MetadataBuilder(
+        specs["model.layers.3.self_attn.swa_cache"],
+        ["model.layers.3.self_attn.swa_cache"],
+        runtime,
+        torch.device("cpu"),
+    ).build(0, common, common_v41_metadata={})
+    assert swa_metadata.slot_mapping.data_ptr() != long_metadata.slot_mapping.data_ptr()
+    assert swa_metadata.slot_mapping.tolist() == [
+        [0, 1],
+        [0, 2],
+        [1, 1],
+        [-1, -1],
+    ]
+
+
 def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runtime):
     specs = collect_specs(runtime)
     spec = specs["model.layers.2.self_attn.long_kv_cache"]
@@ -537,7 +593,13 @@ def test_compressed_metadata_exposes_original_and_cache_coordinates(config, runt
     assert metadata.cache_query_start_loc.tolist() == [0, 2, 3]
     assert metadata.num_cache_tokens == 3
     assert metadata.max_cache_seq_len == 2
-    assert metadata.slot_mapping.tolist() == [0, -1, 1, 32, -1]
+    assert metadata.slot_mapping.tolist() == [
+        [0, 0],
+        [-1, -1],
+        [0, 1],
+        [1, 0],
+        [-1, -1],
+    ]
     assert metadata.num_prefills == 1
     assert metadata.num_prefill_tokens == 3
     assert metadata.num_decodes == 1
@@ -571,7 +633,14 @@ def test_merged_metadata_preserves_nonconsecutive_block_ids(runtime, end):
         rows = 128 // ratio
         expected = table[0, positions // 128] * rows + (positions % 128) // ratio
         expected = torch.where((positions + 1) % ratio == 0, expected, -1)
-        torch.testing.assert_close(metadata.slot_mapping, expected)
+        valid = expected >= 0
+        physical = expected.clamp_min(0)
+        expected_2d = torch.stack(
+            (physical // spec.storage_block_size, physical % spec.storage_block_size),
+            dim=-1,
+        ).to(torch.int32)
+        expected_2d[~valid] = -1
+        torch.testing.assert_close(metadata.slot_mapping, expected_2d)
         assert metadata.logical_block_size == 128
         assert metadata.storage_block_size == rows
         assert metadata.cache_seq_lens.tolist() == [end // ratio]

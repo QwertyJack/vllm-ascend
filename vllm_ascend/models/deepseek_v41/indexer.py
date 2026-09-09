@@ -9,7 +9,7 @@ from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
-    fused_scatter_cache,
+    scatter_cache_v2,
 )
 from vllm_ascend.core.deepseek_v41 import DeepseekV41IndexerSpec
 from vllm_ascend.worker.device_metadata import (
@@ -104,8 +104,8 @@ class DeepseekV41Indexer(nn.Module):
             key, dst_type=torch.int8
         )
         k_cache, scale_cache = self.k_cache.kv_cache[0]
-        fused_scatter_cache(k_cache, slots, quantized)
-        fused_scatter_cache(
+        scatter_cache_v2(k_cache, slots, quantized)
+        scatter_cache_v2(
             scale_cache,
             slots,
             scale.unsqueeze(-1).to(torch.float16),

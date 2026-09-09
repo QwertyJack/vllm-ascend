@@ -294,33 +294,26 @@ def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
     cache[pages, rows] = write_values.to(cache.dtype)
 
 
-def fused_scatter_cache(
-    cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
+def scatter_cache_v2(
+    cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    values: torch.Tensor,
 ) -> None:
-    """Store fixed cache rows with V4's stride-aware Ascend operator.
+    """Store rows using builder-prepared coordinates and V4's Ascend op.
 
     V4.1 cache planes can be views into a larger layer-outermost slot, so the
     physical page stride is not necessarily the contiguous stride implied by
-    the plane shape. ``npu_scatter_nd_update_v2`` forwards that stride to the
-    device operator. Invalid graph rows are masked and redirected to the
-    reserved null row without introducing data-dependent output shapes.
+    the plane shape. ``npu_scatter_nd_update_v2`` preserves that stride and
+    treats the builder's ``[-1, -1]`` coordinates as skipped rows, matching V4.
     """
+    if slot_mapping.ndim != 2 or slot_mapping.shape[-1] != 2:
+        raise ValueError(
+            "V4.1 fused cache store requires builder-prepared [T, 2] "
+            f"slot_mapping, got {tuple(slot_mapping.shape)}"
+        )
     cache = cache.squeeze(-2)
-    slots = slots[: values.shape[0]].long()
-    valid = slots >= 0
-    physical = slots.clamp_min(0)
-    indices = torch.stack(
-        (
-            torch.div(physical, cache.shape[1], rounding_mode="floor"),
-            physical.remainder(cache.shape[1]),
-        ),
-        dim=-1,
-    ).to(torch.int32).contiguous()
-    updates = torch.where(
-        valid.view((-1,) + (1,) * (values.ndim - 1)),
-        values,
-        torch.zeros_like(values),
-    ).to(cache.dtype).contiguous()
+    indices = slot_mapping[: values.shape[0]]
+    updates = values.to(cache.dtype).contiguous()
     torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
 
 
@@ -645,7 +638,7 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        fused_scatter_cache(
+        scatter_cache_v2(
             attn.long_kv_cache.kv_cache[0],
             long_slots,
             latent.squeeze(1),
@@ -804,7 +797,7 @@ class DeepseekV41EagerAttentionImpl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
-        fused_scatter_cache(
+        scatter_cache_v2(
             attn.dsa_attn.swa_cache_layer.kv_cache[0],
             metadata.swa.slot_mapping,
             kv,
@@ -844,6 +837,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._supports_device_ops = getattr(device, "type", "cpu") != "cpu"
         self._slot_mapping = torch.full(
             (max_tokens,), -1, dtype=torch.int64, device=device
+        )
+        self._slot_mapping_2d = torch.full(
+            (max_tokens, 2), -1, dtype=torch.int32, device=device
         )
         self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
         self._cache_seq_lens = torch.zeros(
@@ -1014,15 +1010,48 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             if cache_kind in {"swa", "compressor_state"}
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
-        if self._supports_device_ops:
-            self._slot_mapping[:num_input_tokens].copy_(
-                raw_slots[:num_input_tokens]
-            )
-            slots = self._slot_mapping[:num_input_tokens]
+        if is_compressor_state:
+            if self._supports_device_ops:
+                self._slot_mapping[:num_input_tokens].copy_(
+                    raw_slots[:num_input_tokens]
+                )
+                slots = self._slot_mapping[:num_input_tokens]
+            else:
+                # Preserve the caller-owned CPU tensor for source-of-truth
+                # tests. C2 consumes the flat mapping for state arithmetic.
+                slots = raw_slots
         else:
-            # Preserve the caller-owned CPU tensor for source-of-truth tests;
-            # C2 consumers below still use only the active input-token rows.
-            slots = raw_slots
+            # Scope ``shared`` to one framework KV cache group in the model
+            # runner. Long KV and Indexer builders with the same physical
+            # layout then share one persistent [T, 2] mapping, while every SWA
+            # group owns a distinct mapping buffer.
+            slot_key = f"slot:c{ratio}:b{spec.storage_block_size}"
+            prepared_slots = shared.get(slot_key)
+            if prepared_slots is None:
+                active_slots = raw_slots[:num_input_tokens]
+                valid = active_slots >= 0
+                physical = active_slots.clamp_min(0)
+                self._slot_mapping_2d[:num_input_tokens, 0].copy_(
+                    torch.where(
+                        valid,
+                        torch.div(
+                            physical,
+                            spec.storage_block_size,
+                            rounding_mode="floor",
+                        ),
+                        -1,
+                    )
+                )
+                self._slot_mapping_2d[:num_input_tokens, 1].copy_(
+                    torch.where(
+                        valid,
+                        physical.remainder(spec.storage_block_size),
+                        -1,
+                    )
+                )
+                prepared_slots = self._slot_mapping_2d[:num_input_tokens]
+                shared[slot_key] = prepared_slots
+            slots = prepared_slots
         coordinates = _cache_coordinates(common, ratio, compressed)
         self._seq_lens[:num_reqs].copy_(coordinates["seq_lens"])
         if num_actual_reqs < num_reqs:
