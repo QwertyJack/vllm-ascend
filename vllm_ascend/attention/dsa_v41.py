@@ -294,6 +294,36 @@ def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
     cache[pages, rows] = write_values.to(cache.dtype)
 
 
+def fused_scatter_cache(
+    cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor
+) -> None:
+    """Store fixed cache rows with V4's stride-aware Ascend operator.
+
+    V4.1 cache planes can be views into a larger layer-outermost slot, so the
+    physical page stride is not necessarily the contiguous stride implied by
+    the plane shape. ``npu_scatter_nd_update_v2`` forwards that stride to the
+    device operator. Invalid graph rows are masked and redirected to the
+    reserved null row without introducing data-dependent output shapes.
+    """
+    cache = cache.squeeze(-2)
+    slots = slots[: values.shape[0]].long()
+    valid = slots >= 0
+    physical = slots.clamp_min(0)
+    indices = torch.stack(
+        (
+            torch.div(physical, cache.shape[1], rounding_mode="floor"),
+            physical.remainder(cache.shape[1]),
+        ),
+        dim=-1,
+    ).to(torch.int32).contiguous()
+    updates = torch.where(
+        valid.view((-1,) + (1,) * (values.ndim - 1)),
+        values,
+        torch.zeros_like(values),
+    ).to(cache.dtype).contiguous()
+    torch.ops._C_ascend.npu_scatter_nd_update_v2(cache, indices, updates)
+
+
 def gather_cache_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
     """Read physical rows without flattening a block-strided packed view."""
     cache = cache.squeeze(-2)
@@ -615,7 +645,7 @@ class DeepseekV41EagerAttentionImpl:
             rotary_mode="interleave",
             partial_slice=[attn.nope_head_dim, attn.head_dim],
         )
-        scatter_cache(
+        fused_scatter_cache(
             attn.long_kv_cache.kv_cache[0],
             long_slots,
             latent.squeeze(1),
@@ -774,7 +804,7 @@ class DeepseekV41EagerAttentionImpl:
         positions = metadata.positions[: hidden_states.shape[0]]
         cos, sin = metadata.rope(attn.rotary_emb.layername, hidden_states.shape[0])
         q, qr, kv = self._project_q_kv(attn, hidden_states, cos, sin)
-        scatter_cache(
+        fused_scatter_cache(
             attn.dsa_attn.swa_cache_layer.kv_cache[0],
             metadata.swa.slot_mapping,
             kv,

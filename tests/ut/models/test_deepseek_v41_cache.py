@@ -16,6 +16,7 @@ from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41EagerAttentionImpl,
     DeepseekV41MetadataBuilder,
     compressed_slot_mapping,
+    fused_scatter_cache,
     gather_cache_rows,
     pad_sparse_indices,
     scatter_cache,
@@ -70,7 +71,11 @@ def runtime(config):
     return SimpleNamespace(
         model_config=SimpleNamespace(hf_text_config=config, enforce_eager=True),
         cache_config=SimpleNamespace(
-            block_size=64, enable_prefix_caching=False, cache_dtype="auto", num_gpu_blocks_override=None
+            block_size=64,
+            enable_prefix_caching=False,
+            cache_dtype="auto",
+            num_gpu_blocks_override=None,
+            prefix_cache_retention_interval=None,
         ),
         compilation_config=SimpleNamespace(static_forward_context={}),
         scheduler_config=SimpleNamespace(disable_hybrid_kv_cache_manager=False),
@@ -375,6 +380,37 @@ def test_scatter_cache_redirects_invalid_rows_to_null_row():
 
     assert cache[0, 0, 0].tolist() == [0.0, 0.0]
     assert cache[0, 3, 0].tolist() == [7.0, 8.0]
+
+
+def test_fused_scatter_cache_uses_page_coordinates_and_preserves_stride(
+    monkeypatch,
+):
+    backing = torch.zeros(3 * 128, dtype=torch.uint8)
+    cache = torch.as_strided(
+        backing.view(torch.float32),
+        size=(3, 4, 1, 2),
+        stride=(32, 2, 2, 1),
+    )
+    values = torch.tensor([[9.0, 9.0], [7.0, 8.0]])
+    calls = []
+
+    def scatter(var, indices, updates):
+        calls.append((var, indices, updates))
+
+    monkeypatch.setattr(
+        torch.ops._C_ascend,
+        "npu_scatter_nd_update_v2",
+        scatter,
+        raising=False,
+    )
+    fused_scatter_cache(cache, torch.tensor([-1, 7]), values)
+
+    var, indices, updates = calls[0]
+    assert var.shape == (3, 4, 2)
+    assert var.stride() == (32, 2, 1)
+    assert indices.dtype == torch.int32
+    assert indices.tolist() == [[0, 0], [1, 3]]
+    assert updates.tolist() == [[0.0, 0.0], [7.0, 8.0]]
 
 
 def test_compression_slot_mapping():
