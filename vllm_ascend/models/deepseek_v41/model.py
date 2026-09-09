@@ -434,10 +434,19 @@ class DeepseekV41DecoderLayer(DeepseekV2DecoderLayer):
             hc_eps=self.hc_eps,
         )
 
-    def hc_post(self, x, residual, post, comb):
+    @staticmethod
+    def hc_post_reference(x, residual, post, comb):
         y = post.unsqueeze(-1) * x.unsqueeze(-2)
         y += (comb.unsqueeze(-1) * residual.unsqueeze(-2)).sum(-3)
         return y.to(x.dtype)
+
+    def hc_post(self, x, residual, post, comb):
+        return torch.ops._C_ascend.npu_hc_post(
+            x.unsqueeze(0),
+            residual.unsqueeze(0),
+            post.unsqueeze(0),
+            comb.unsqueeze(0),
+        ).squeeze(0)
 
     def forward(
         self,
