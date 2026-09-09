@@ -77,15 +77,15 @@ class DeepseekV41Topology:
 class DeepseekV41SharedAttentionState:
     """Per-forward handoff between index sources and their consumer layers."""
 
-    def __init__(self):
-        self.topk_indices = None
-        self.candidates = None
-        self.smla_metadata = {}
+    def __init__(self, topk_indices, candidates):
+        self.topk_indices = topk_indices
+        self.candidates = candidates
 
     def reset(self):
-        self.topk_indices = None
-        self.candidates = None
-        self.smla_metadata.clear()
+        # Source layers overwrite the active rows before any consumer reads
+        # them. Keeping the storage intact avoids replay depending on Python
+        # state mutation and preserves a fixed address for ACL Graph.
+        return None
 
 
 def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:
@@ -376,9 +376,16 @@ class DeepseekV41Attention(DeepseekV4Attention):
             long_kv_source_prefix=self.long_kv_source_prefix,
             index_k_source_prefix=self.index_k_source_prefix,
         )
+        self.v41_layer_name = f"{prefix}.v41_attn"
+        context = vllm_config.compilation_config.static_forward_context
+        if self.v41_layer_name in context:
+            raise ValueError(f"Duplicate V4.1 attention layer: {self.v41_layer_name}")
+        context[self.v41_layer_name] = self
 
     def forward(self, positions, hidden_states, llama_4_scaling=None):
-        return self.v41_impl.forward(self, positions, hidden_states)
+        output = torch.empty_like(hidden_states)
+        torch.ops.vllm.dsa_v41_forward(hidden_states, output, self.v41_layer_name)
+        return output
 
 
 
@@ -476,7 +483,19 @@ class DeepseekV41Model(DeepseekV4Model):
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
-        self.shared_attention_state = DeepseekV41SharedAttentionState()
+        topology = build_layer_plan(self.config)
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        candidate_buffer = torch.full(
+            (max_tokens, 1, topology.candidate_topk_blocks),
+            -1,
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
+        self.candidate_indices_buffer = candidate_buffer
+        self.shared_attention_state = DeepseekV41SharedAttentionState(
+            self.topk_indices_buffer,
+            candidate_buffer,
+        )
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state

@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.config import CUDAGraphMode
 
 from vllm_ascend.attention.dsa_v41 import (
     DeepseekV41CacheLayer,
@@ -235,6 +236,55 @@ def test_unsupported_runtime_fails_before_registration(runtime, feature):
 
         validate_cache_runtime(runtime)
     assert not runtime.compilation_config.static_forward_context
+
+
+def test_full_decode_only_runtime_is_supported(runtime):
+    from vllm_ascend.core.deepseek_v41 import validate_cache_runtime
+
+    runtime.model_config.enforce_eager = False
+    runtime.compilation_config.cudagraph_mode = CUDAGraphMode.FULL_DECODE_ONLY
+    validate_cache_runtime(runtime)
+
+
+def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtime):
+    spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
+    builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
+    common = SimpleNamespace(
+        slot_mapping=torch.tensor([10, 11, -1]),
+        block_table_tensor=torch.tensor([[1], [2], [0]]),
+        query_start_loc=torch.tensor([0, 1, 2, 3]),
+        query_start_loc_cpu=torch.tensor([0, 1, 2, 3]),
+        seq_lens=torch.tensor([3, 4, 9]),
+        seq_lens_cpu=torch.tensor([3, 4, 9]),
+        positions=torch.tensor([2, 3, 0]),
+        num_reqs=3,
+        num_actual_tokens=2,
+        num_input_tokens=3,
+        max_query_len=1,
+        max_seq_len=9,
+        is_prefilling=torch.tensor([False, False, False]),
+    )
+
+    metadata = builder.build(0, common, num_actual_reqs=2)
+
+    assert metadata.num_actual_reqs == 2
+    assert metadata.seq_lens.tolist() == [3, 4, 0]
+    assert metadata.c2_complete_mask.tolist() == [False, True, False]
+    assert metadata.c2_current_state_slots.tolist() == [10, 11, 0]
+    assert metadata.c2_previous_state_slots.tolist() == [10, 10, 0]
+    assert metadata.c2_compressed_slots.tolist() == [-1, 5, -1]
+    assert metadata.c2_source_positions.tolist() == [0, 2, 0]
+    assert metadata.c2_metadata_group_id == id(builder._c2_complete_mask)
+
+
+def test_scatter_cache_redirects_invalid_rows_to_null_row():
+    cache = torch.full((1, 8, 1, 2), -3.0)
+    values = torch.tensor([[9.0, 9.0], [7.0, 8.0]])
+
+    scatter_cache(cache, torch.tensor([-1, 3]), values)
+
+    assert cache[0, 0, 0].tolist() == [0.0, 0.0]
+    assert cache[0, 3, 0].tolist() == [7.0, 8.0]
 
 
 def test_compression_slot_mapping():

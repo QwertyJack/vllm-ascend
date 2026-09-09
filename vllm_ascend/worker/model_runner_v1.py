@@ -117,7 +117,10 @@ from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAtt
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
-from vllm_ascend.attention.dsa_v41 import DeepseekV41CacheLayer
+from vllm_ascend.attention.dsa_v41 import (
+    DeepseekV41CacheLayer,
+    DeepseekV41MetadataBuilder,
+)
 from vllm_ascend.attention.mla_v1 import AscendMLABackend
 from vllm_ascend.attention.utils import (
     AscendCommonAttentionMetadata,
@@ -2404,6 +2407,22 @@ class NPUModelRunner(GPUModelRunner):
             self.model_config.is_encoder_decoder
             or self.model_config.requires_raw_input_tokens
         )
+        # V4.1's Python reference compressor/indexer path is correctness-safe
+        # in eager mode, while only uniform decode is prepared for a full ACL
+        # graph. FULL_DECODE_ONLY dispatches prefills and unsupported decode
+        # shapes as runtime NONE; bypass the compiled model for those calls so
+        # the mode is genuinely "eager prefill + full-graph decode".
+        hf_model_type = getattr(self.model_config.hf_config, "model_type", None)
+        hf_text_model_type = getattr(
+            self.model_config.hf_text_config, "model_type", None
+        )
+        is_deepseek_v41 = (
+            hf_model_type == "deepseek_v4.1"
+            or hf_text_model_type == "deepseek_v4.1_text"
+        )
+        v41_eager_fallback = (
+            is_deepseek_v41 and cudagraph_mode == CUDAGraphMode.NONE
+        )
 
         # Run forward pass
         defer_kv_connector_finalize = self.speculative_config is not None and (
@@ -2422,7 +2441,7 @@ class NPUModelRunner(GPUModelRunner):
                 num_actual_tokens=scheduler_output.total_num_scheduled_tokens,
                 model_instance=self.model,
                 device_metadata_executor=active_device_metadata_executor,
-                skip_compiled=has_encoder_input,
+                skip_compiled=has_encoder_input or v41_eager_fallback,
                 has_sinks=self._has_sinks,
                 eplb_heat_collection_status=self.eplb_heat_collection_status if self.dynamic_eplb else False,
             ),
@@ -3372,6 +3391,7 @@ class NPUModelRunner(GPUModelRunner):
             attn_gid: int,
             common_attn_metadata: CommonAttentionMetadata,
             common_ratio_to_sas_metadata: dict,
+            common_v41_metadata: dict,
             ubid: int | None = None,
         ) -> None:
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
@@ -3435,11 +3455,18 @@ class NPUModelRunner(GPUModelRunner):
                     common_ratio_to_sas_metadata=common_ratio_to_sas_metadata,
                     full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
                 )
+            elif isinstance(builder, DeepseekV41MetadataBuilder):
+                extra_attn_metadata_args = dict(
+                    num_actual_reqs=num_reqs,
+                    common_v41_metadata=common_v41_metadata,
+                    full_graph_mode=cudagraph_runtime_mode == CUDAGraphMode.FULL,
+                )
             if (for_cudagraph_capture
                     and not isinstance(builder, (
                         AscendDSAMetadataBuilder,
                         AscendDSACPMetadataBuilder,
                         AscendSFADCPMetadataBuilder,
+                        DeepseekV41MetadataBuilder,
                     ))):
                 attn_metadata_i = builder.build_for_cudagraph_capture(common_attn_metadata)
             else:
@@ -3473,6 +3500,7 @@ class NPUModelRunner(GPUModelRunner):
         # Prepare the attention metadata for each KV cache group and make layers
         # in the same group share the same metadata.
         common_ratio_to_sas_metadata: dict[Any, Any] = {}
+        common_v41_metadata: dict[str, Any] = {}
         spec_decode_common_attn_metadata = None
         for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
             cm = copy(cm_base)  # shallow copy
@@ -3521,6 +3549,7 @@ class NPUModelRunner(GPUModelRunner):
                     attn_gid,
                     cm,
                     common_ratio_to_sas_metadata,
+                    common_v41_metadata,
                 )
         if req_doc_ranges is not None:
             if isinstance(attn_metadata, list):

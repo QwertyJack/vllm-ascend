@@ -15,9 +15,17 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 from torch import nn
+from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+from vllm.config import CUDAGraphMode, VllmConfig
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
-from vllm.v1.attention.backend import AttentionBackend, AttentionMetadata, AttentionMetadataBuilder
+from vllm.utils.torch_utils import direct_register_custom_op
+from vllm.v1.attention.backend import (
+    AttentionBackend,
+    AttentionCGSupport,
+    AttentionMetadata,
+    AttentionMetadataBuilder,
+)
 
 from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41CompressorStateSpec,
@@ -26,6 +34,51 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41SWASpec,
 )
 from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.worker.device_metadata import (
+    DeviceMetadataStage,
+    DeviceMetadataTask,
+    wait_for_device_metadata,
+)
+
+
+V41_METADATA_BUFFER_SIZE = 1024
+
+
+@eager_break_during_capture
+def dsa_v41_forward(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    """Execute V4.1 attention behind an explicit graph side-effect boundary."""
+    forward_context = get_forward_context()
+    attn = forward_context.no_compile_layers[layer_name]
+    projected = attn.v41_impl.forward(attn, None, hidden_states)
+    output.copy_(projected)
+
+
+def dsa_v41_forward_fake(
+    hidden_states: torch.Tensor,
+    output: torch.Tensor,
+    layer_name: str,
+) -> None:
+    return None
+
+
+direct_register_custom_op(
+    op_name="dsa_v41_forward",
+    op_func=dsa_v41_forward,
+    mutates_args=["output"],
+    fake_impl=dsa_v41_forward_fake,
+    dispatch_key="PrivateUse1",
+)
+
+
+def _config_value(config: Any, name: str, default: Any = None) -> Any:
+    """Read one field from either an HF config object or a raw config dict."""
+    if isinstance(config, dict):
+        return config.get(name, default)
+    return getattr(config, name, default)
 
 
 @dataclass
@@ -76,6 +129,15 @@ class DeepseekV41Metadata(AttentionMetadata):
     causal: bool | torch.Tensor = True
     ori_win_left: int = 0
     ori_win_right: int = 0
+    smla_metadata: torch.Tensor | None = None
+    qli_metadata: torch.Tensor | None = None
+    cmp_residual: torch.Tensor | None = None
+    c2_complete_mask: torch.Tensor | None = None
+    c2_current_state_slots: torch.Tensor | None = None
+    c2_previous_state_slots: torch.Tensor | None = None
+    c2_compressed_slots: torch.Tensor | None = None
+    c2_source_positions: torch.Tensor | None = None
+    c2_metadata_group_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -208,15 +270,23 @@ def _request_counts(common: Any, num_reqs: int):
 
 
 def scatter_cache(cache: torch.Tensor, slots: torch.Tensor, values: torch.Tensor) -> None:
-    """Write valid rows into one V4.1 paged cache using ordinary tensor ops."""
+    """Write rows without Tensor-driven Python control flow.
+
+    Invalid rows are redirected to the reserved null row.  V4.1 reserves page
+    zero precisely so padded and incomplete graph rows cannot touch live KV.
+    """
     cache = cache.squeeze(-2)
     slots = slots[: values.shape[0]].long()
     valid = slots >= 0
-    if valid.any():
-        physical = slots[valid]
-        pages = torch.div(physical, cache.shape[1], rounding_mode="floor")
-        rows = physical.remainder(cache.shape[1])
-        cache[pages, rows] = values[valid].to(cache.dtype)
+    physical = slots.clamp_min(0)
+    pages = torch.div(physical, cache.shape[1], rounding_mode="floor")
+    rows = physical.remainder(cache.shape[1])
+    write_values = torch.where(
+        valid.view((-1,) + (1,) * (values.ndim - 1)),
+        values,
+        torch.zeros_like(values),
+    )
+    cache[pages, rows] = write_values.to(cache.dtype)
 
 
 def gather_cache_rows(cache: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
@@ -376,7 +446,6 @@ class DeepseekV41EagerAttentionImpl:
             if role.is_kv_source and role.compress_ratio == 2
             else None
         )
-
     def _get_layer_metadata(self, metadata) -> DeepseekV41LayerMetadata:
         try:
             swa = metadata[self.swa_prefix]
@@ -445,34 +514,60 @@ class DeepseekV41EagerAttentionImpl:
         if ratio == 1:
             latent = compressor(hidden_states, 0)
             completed = torch.ones_like(positions, dtype=torch.bool)
+            source_positions = positions
+            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
+            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
         else:
             if compressor_metadata.state is None:
                 raise RuntimeError("V4.1 ratio-2 source is missing compressor-state metadata")
+            state_metadata = compressor_metadata.state
             state_cache = compressor.state_cache.kv_cache[0].squeeze(-2)
             kv = compressor.wkv(hidden_states.float())
             score = compressor.wgate(hidden_states.float())
             state_rows = torch.cat((kv, score), -1)
             scatter_cache(
                 compressor.state_cache.kv_cache[0],
-                compressor_metadata.state.slot_mapping,
+                state_metadata.slot_mapping,
                 state_rows,
             )
-            completed = positions.remainder(ratio) == ratio - 1
-            completed_slots = compressor_metadata.state.slot_mapping[
-                : positions.shape[0]
-            ][completed].long()
-            current = gather_cache_rows(state_cache, completed_slots)
-            previous = gather_cache_rows(state_cache, completed_slots - 1)
+            completed = state_metadata.c2_complete_mask
+            current_slots = state_metadata.c2_current_state_slots
+            previous_slots = state_metadata.c2_previous_state_slots
+            source_positions = state_metadata.c2_source_positions
+            if completed is not None and state_metadata.c2_metadata_group_id is not None:
+                wait_for_device_metadata(
+                    DeviceMetadataStage.COMPRESSOR,
+                    state_metadata.c2_metadata_group_id,
+                )
+            if any(
+                value is None
+                for value in (completed, current_slots, previous_slots, source_positions)
+            ):
+                completed = positions.remainder(ratio) == ratio - 1
+                current_slots = state_metadata.slot_mapping[: positions.shape[0]].long()
+                previous_slots = torch.where(
+                    completed & (current_slots > 0),
+                    current_slots - 1,
+                    current_slots.clamp_min(0),
+                )
+                source_positions = torch.where(
+                    completed, positions + 1 - ratio, torch.zeros_like(positions)
+                )
+            completed = completed[: positions.shape[0]]
+            current_slots = current_slots[: positions.shape[0]].long().clamp_min(0)
+            previous_slots = previous_slots[: positions.shape[0]].long().clamp_min(0)
+            source_positions = source_positions[: positions.shape[0]]
+            current = gather_cache_rows(state_cache, current_slots)
+            previous = gather_cache_rows(state_cache, previous_slots)
             pair = torch.stack((previous, current), 1)
             latent = (
                 pair[..., : attn.head_dim]
                 * pair[..., attn.head_dim :].softmax(1)
             ).sum(1)
             latent = compressor.norm(latent.to(hidden_states.dtype))
-        if latent.shape[0] == 0:
-            return
+            index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
+            long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
 
-        source_positions = positions[completed] + 1 - ratio
         source_cos, source_sin = get_cos_and_sin_dsa(source_positions)
         source_cos = source_cos[attn.rotary_emb.layername]
         source_sin = source_sin[attn.rotary_emb.layername]
@@ -480,7 +575,7 @@ class DeepseekV41EagerAttentionImpl:
             raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
             latent,
-            indexer_metadata.cache.slot_mapping[: positions.shape[0]][completed],
+            index_slots,
             source_cos,
             source_sin,
         )
@@ -494,7 +589,7 @@ class DeepseekV41EagerAttentionImpl:
         )
         scatter_cache(
             attn.long_kv_cache.kv_cache[0],
-            compressor_metadata.cache.slot_mapping[: positions.shape[0]][completed],
+            long_slots,
             latent.squeeze(1),
         )
 
@@ -505,9 +600,7 @@ class DeepseekV41EagerAttentionImpl:
         if shared is None:
             raise RuntimeError("V4.1 shared attention state is not initialized")
         if not self.role.is_index_source:
-            if shared.topk_indices is None:
-                raise RuntimeError("V4.1 sparse consumer ran before its index source")
-            return shared.topk_indices
+            return shared.topk_indices[: hidden_states.shape[0]]
         if attn.indexer is None or metadata.indexer is None:
             raise RuntimeError("V4.1 index source is missing indexer metadata")
 
@@ -525,11 +618,12 @@ class DeepseekV41EagerAttentionImpl:
             uses_candidate_filter=self.role.uses_candidate_filter,
             candidate_topk_blocks=self.topology.candidate_topk_blocks,
             candidate_block_size=self.topology.candidate_block_size,
-            candidates=shared.candidates,
+            candidates=shared.candidates[: hidden_states.shape[0]],
         )
-        shared.topk_indices = selected
-        shared.candidates = candidates
-        return selected
+        shared.topk_indices[: selected.shape[0]].copy_(selected)
+        if self.role.is_candidate_source:
+            shared.candidates[: candidates.shape[0]].copy_(candidates)
+        return shared.topk_indices[: selected.shape[0]]
 
     def _attention(self, attn, q, positions, metadata, compressed_indices):
         source_cache = None
@@ -586,9 +680,9 @@ class DeepseekV41EagerAttentionImpl:
         has_compressed = self.role.compress_ratio in (1, 2)
         ratio = self.role.compress_ratio if has_compressed else 0
         num_reqs = metadata.swa.num_reqs
-        query_start_loc = metadata.swa.query_start_loc[: num_reqs + 1].int()
-        seq_lens = metadata.swa.seq_lens[:num_reqs].int()
-        ori_block_table = metadata.swa.block_table[:num_reqs].int()
+        query_start_loc = metadata.swa.query_start_loc[: num_reqs + 1]
+        seq_lens = metadata.swa.seq_lens[:num_reqs]
+        ori_block_table = metadata.swa.block_table[:num_reqs]
         cmp_block_table = None
         cmp_seq_lens = None
         cmp_residual = None
@@ -597,44 +691,22 @@ class DeepseekV41EagerAttentionImpl:
         if has_compressed:
             if source_cache is None or metadata.attention is None or compressed_indices is None:
                 raise RuntimeError("V4.1 compressed attention is missing KV or TopK metadata")
-            cmp_block_table = metadata.attention.block_table[:num_reqs].int()
-            cmp_seq_lens = metadata.attention.cache_seq_lens[:num_reqs].int()
-            cmp_residual = seq_lens.remainder(ratio) if ratio != 1 else None
+            cmp_block_table = metadata.attention.block_table[:num_reqs]
+            cmp_seq_lens = metadata.attention.cache_seq_lens[:num_reqs]
+            cmp_residual = metadata.attention.cmp_residual
             cmp_topk = self.topology.index_topk
             if cmp_topk not in (512, 1024):
                 raise ValueError(f"SparseFlashMla only supports TopK 512 or 1024, got {cmp_topk}")
             cmp_indices = pad_sparse_indices(compressed_indices, cmp_topk)
 
-        shared = attn.shared_state
-        if shared is None:
-            raise RuntimeError("V4.1 shared attention state is not initialized")
-        op_metadata = shared.smla_metadata.get(ratio)
+        operator_metadata = metadata.attention if has_compressed else metadata.swa
+        op_metadata = operator_metadata.smla_metadata
         if op_metadata is None:
-            op_metadata = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
-                attn.n_local_heads,
-                1,
-                attn.head_dim,
-                cu_seqlens_q=query_start_loc,
-                seqused_ori_kv=seq_lens,
-                seqused_cmp_kv=cmp_seq_lens,
-                cmp_residual_kv=cmp_residual,
-                batch_size=num_reqs,
-                max_seqlen_q=metadata.swa.max_query_len,
-                max_seqlen_ori_kv=metadata.swa.max_seq_len,
-                max_seqlen_cmp_kv=(metadata.attention.max_cache_seq_len if has_compressed else 0),
-                ori_topk=0,
-                cmp_topk=cmp_topk,
-                cmp_ratio=ratio,
-                ori_mask_mode=4,
-                cmp_mask_mode=3 if has_compressed else 0,
-                ori_win_left=attn.window_size - 1,
-                ori_win_right=0,
-                layout_q="TND",
-                layout_kv="PA_BBND",
-                has_ori_kv=True,
-                has_cmp_kv=has_compressed,
-            )
-            shared.smla_metadata[ratio] = op_metadata
+            raise RuntimeError(f"V4.1 ratio-{ratio} SMLA metadata was not built")
+        wait_for_device_metadata(
+            DeviceMetadataStage.ATTENTION,
+            id(op_metadata),
+        )
         output, _ = torch.ops._C_ascend.npu_sparse_flash_mla(
             q,
             ori_kv=attn.dsa_attn.swa_cache_layer.kv_cache[0],
@@ -660,6 +732,11 @@ class DeepseekV41EagerAttentionImpl:
             return_softmax_lse=False,
         )
         return output
+
+    @staticmethod
+    def update_graph_params(*args, **kwargs):
+        """V4.1 owns stable metadata buffers; no backend pointer patch is needed."""
+        return None
 
     def forward(self, attn, positions, hidden_states):
         forward_context = get_forward_context()
@@ -695,10 +772,103 @@ class DeepseekV41EagerAttentionImpl:
 class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
     def __init__(self, kv_cache_spec, layer_names, vllm_config, device):
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        max_tokens = getattr(
+            vllm_config.scheduler_config, "max_num_batched_tokens", 4096
+        )
+        max_reqs = getattr(vllm_config.scheduler_config, "max_num_seqs", 256)
+        self._supports_device_ops = getattr(device, "type", "cpu") != "cpu"
+        self._slot_mapping = torch.full(
+            (max_tokens,), -1, dtype=torch.int64, device=device
+        )
+        self._seq_lens = torch.zeros(max_reqs, dtype=torch.int32, device=device)
+        self._cache_seq_lens = torch.zeros(
+            max_reqs, dtype=torch.int32, device=device
+        )
+        self._cmp_residual = torch.zeros(
+            max_reqs, dtype=torch.int32, device=device
+        )
+        self._smla_metadata = torch.zeros(
+            V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
+        )
+        self._qli_metadata = torch.zeros(
+            V41_METADATA_BUFFER_SIZE, dtype=torch.int32, device=device
+        )
+        self._c2_complete_mask = torch.zeros(
+            max_tokens, dtype=torch.bool, device=device
+        )
+        self._c2_current_state_slots = torch.zeros(
+            max_tokens, dtype=torch.int64, device=device
+        )
+        self._c2_previous_state_slots = torch.zeros(
+            max_tokens, dtype=torch.int64, device=device
+        )
+        self._c2_compressed_slots = torch.full(
+            (max_tokens,), -1, dtype=torch.int64, device=device
+        )
+        self._c2_source_positions = torch.zeros(
+            max_tokens, dtype=torch.int64, device=device
+        )
+        self._device_metadata_enabled = False
+        self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    @classmethod
+    def get_cudagraph_support(
+        cls,
+        vllm_config: VllmConfig,
+        kv_cache_spec,
+    ) -> AttentionCGSupport:
+        return AttentionCGSupport.UNIFORM_BATCH
+
+    def build_for_cudagraph_capture(
+        self,
+        common_attn_metadata,
+        **kwargs,
+    ) -> DeepseekV41Metadata:
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            **kwargs,
+        )
+
+    def enable_device_metadata(self) -> None:
+        self._device_metadata_enabled = True
+
+    def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
+        tasks = self._device_metadata_tasks
+        self._device_metadata_tasks = ()
+        return tasks
+
+    def _publish_task(
+        self,
+        shared: dict[str, Any],
+        key: str,
+        buffer: torch.Tensor,
+        stage: DeviceMetadataStage,
+        run,
+    ) -> torch.Tensor:
+        existing = shared.get(key)
+        if existing is not None:
+            return existing
+        shared[key] = buffer
+        if self._device_metadata_enabled:
+            self._device_metadata_tasks = (
+                *self._device_metadata_tasks,
+                DeviceMetadataTask(stage, run, id(buffer)),
+            )
+        else:
+            run()
+        return buffer
+
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        **kwargs,
+    ):
         if common_prefix_len:
             raise NotImplementedError("V4.1 prefix caching is not implemented")
+        self._device_metadata_tasks = ()
         spec = self.kv_cache_spec
         common = common_attn_metadata
         is_compressor_state = isinstance(spec, DeepseekV41CompressorStateSpec)
@@ -714,29 +884,213 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         else:
             raise TypeError(f"Unsupported V4.1 cache spec: {type(spec).__name__}")
 
+        num_reqs = int(getattr(common, "num_reqs", common.seq_lens.shape[0]))
+        num_actual_reqs = int(kwargs.get("num_actual_reqs", num_reqs))
+        num_actual_reqs = min(num_actual_reqs, num_reqs)
+        num_input_tokens = int(
+            getattr(common, "num_input_tokens", common.slot_mapping.shape[0])
+        )
+        num_actual_tokens = int(
+            getattr(common, "num_actual_tokens", num_input_tokens)
+        )
+        shared = kwargs.get("common_v41_metadata")
+        if shared is None:
+            shared = {}
+
         # SWA and compressor state are addressed in original-token coordinates.
         # Long KV and index K are addressed in completed compression groups.
         compressed = cache_kind in {"long_kv", "index_k"}
-        slots = (
+        raw_slots = (
             common.slot_mapping
             if cache_kind in {"swa", "compressor_state"}
             else compressed_slot_mapping(common.slot_mapping, ratio)
         )
+        if self._supports_device_ops:
+            self._slot_mapping[:num_input_tokens].copy_(
+                raw_slots[:num_input_tokens]
+            )
+            slots = self._slot_mapping[:num_input_tokens]
+        else:
+            # Preserve the caller-owned CPU tensor for source-of-truth tests;
+            # C2 consumers below still use only the active input-token rows.
+            slots = raw_slots
         coordinates = _cache_coordinates(common, ratio, compressed)
+        self._seq_lens[:num_reqs].copy_(coordinates["seq_lens"])
+        if num_actual_reqs < num_reqs:
+            self._seq_lens[num_actual_reqs:num_reqs].zero_()
+        plane_ratio = ratio if compressed else 1
+        self._cache_seq_lens[:num_reqs].copy_(
+            torch.div(
+                self._seq_lens[:num_reqs],
+                plane_ratio,
+                rounding_mode="floor",
+            )
+        )
+        coordinates["seq_lens"] = self._seq_lens[:num_reqs]
+        coordinates["cache_seq_lens"] = self._cache_seq_lens[:num_reqs]
+        cmp_residual_buffer = None
+        if compressed and ratio == 2:
+            self._cmp_residual[:num_reqs].copy_(
+                self._seq_lens[:num_reqs].remainder(ratio)
+            )
+            cmp_residual_buffer = self._cmp_residual[:num_reqs]
         positions = getattr(common, "positions", None)
         cos = sin = None
         if cache_kind == "swa" and positions is not None:
-            positions = positions[: common.num_input_tokens].long()
-            cos, sin = get_cos_and_sin_dsa(positions)
-        num_reqs = int(getattr(common, "num_reqs", common.seq_lens.shape[0]))
+            positions = positions[:num_input_tokens].long()
         (
             num_decodes,
             num_decode_tokens,
             num_prefills,
             num_prefill_tokens,
         ) = _request_counts(common, num_reqs)
+        if cache_kind == "swa" and positions is not None:
+            cos, sin = get_cos_and_sin_dsa(
+                positions,
+                use_cache=num_prefills == 0,
+            )
         text_config = self.vllm_config.model_config.hf_text_config
-        window_size = int(getattr(text_config, "sliding_window", 0))
+        window_size = int(_config_value(text_config, "sliding_window", 0))
+        n_local_heads = (
+            int(_config_value(text_config, "num_attention_heads"))
+            // self.vllm_config.parallel_config.tensor_parallel_size
+        )
+        head_dim = int(_config_value(text_config, "head_dim"))
+        index_topk = int(_config_value(text_config, "index_topk"))
+        operator_ratio = 0 if cache_kind == "swa" else ratio
+        smla_metadata = None
+        qli_metadata = None
+
+        if self._supports_device_ops and cache_kind in {"swa", "long_kv"}:
+            has_compressed = operator_ratio in (1, 2)
+            cmp_seq_lens = (
+                self._cache_seq_lens[:num_reqs] if has_compressed else None
+            )
+            cmp_residual = cmp_residual_buffer
+
+            def build_smla_metadata() -> None:
+                value = torch.ops._C_ascend.npu_sparse_flash_mla_metadata(
+                    n_local_heads,
+                    1,
+                    head_dim,
+                    cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
+                    seqused_ori_kv=self._seq_lens[:num_reqs],
+                    seqused_cmp_kv=cmp_seq_lens,
+                    cmp_residual_kv=cmp_residual,
+                    batch_size=num_reqs,
+                    max_seqlen_q=int(getattr(common, "max_query_len", 0)),
+                    max_seqlen_ori_kv=int(getattr(common, "max_seq_len", 0)),
+                    max_seqlen_cmp_kv=(
+                        coordinates["max_cache_seq_len"]
+                        if has_compressed
+                        else 0
+                    ),
+                    ori_topk=0,
+                    cmp_topk=index_topk if has_compressed else 0,
+                    cmp_ratio=operator_ratio,
+                    ori_mask_mode=4,
+                    cmp_mask_mode=3 if has_compressed else 0,
+                    ori_win_left=max(0, window_size - 1),
+                    ori_win_right=0,
+                    layout_q="TND",
+                    layout_kv="PA_BBND",
+                    has_ori_kv=True,
+                    has_cmp_kv=has_compressed,
+                )
+                self._smla_metadata.copy_(value)
+
+            smla_metadata = self._publish_task(
+                shared,
+                f"smla:c{operator_ratio}",
+                self._smla_metadata,
+                DeviceMetadataStage.ATTENTION,
+                build_smla_metadata,
+            )
+
+        if self._supports_device_ops and cache_kind == "index_k":
+            residual = cmp_residual_buffer
+
+            def build_qli_metadata() -> None:
+                value = torch.ops._C_ascend.npu_quant_lightning_indexer_v2_metadata(
+                    int(_config_value(text_config, "index_n_heads")),
+                    1,
+                    int(_config_value(text_config, "index_head_dim")),
+                    index_topk,
+                    2,
+                    cu_seqlens_q=common.query_start_loc[: num_reqs + 1].int(),
+                    seqused_k=self._cache_seq_lens[:num_reqs],
+                    cmp_residual_k=residual,
+                    batch_size=num_reqs,
+                    max_seqlen_q=int(getattr(common, "max_query_len", 0)),
+                    max_seqlen_k=coordinates["max_cache_seq_len"],
+                    layout_q="TND",
+                    layout_k="PA_BBND",
+                    mask_mode=3,
+                    cmp_ratio=ratio,
+                )
+                self._qli_metadata.copy_(value)
+
+            qli_metadata = self._publish_task(
+                shared,
+                f"qli:c{ratio}",
+                self._qli_metadata,
+                DeviceMetadataStage.INDEXER,
+                build_qli_metadata,
+            )
+
+        c2_complete_mask = None
+        c2_current_state_slots = None
+        c2_previous_state_slots = None
+        c2_compressed_slots = None
+        c2_source_positions = None
+        c2_metadata_group_id = None
+        if cache_kind == "compressor_state" and getattr(common, "positions", None) is not None:
+            # ``slots`` is the authoritative plane view. On NPU it aliases the
+            # persistent builder buffer; on CPU unit tests it intentionally
+            # remains the caller-owned tensor.
+            current_slots = slots[:num_input_tokens]
+            input_positions = common.positions[:num_input_tokens].long()
+
+            def build_c2_metadata() -> None:
+                complete = input_positions.remainder(2) == 1
+                safe_current = current_slots.clamp_min(0)
+                self._c2_complete_mask[:num_input_tokens].copy_(complete)
+                self._c2_current_state_slots[:num_input_tokens].copy_(
+                    safe_current
+                )
+                self._c2_previous_state_slots[:num_input_tokens].copy_(
+                    torch.where(
+                        complete & (safe_current > 0),
+                        safe_current - 1,
+                        safe_current,
+                    )
+                )
+                self._c2_compressed_slots[:num_input_tokens].copy_(
+                    compressed_slot_mapping(current_slots, 2)
+                )
+                self._c2_source_positions[:num_input_tokens].copy_(
+                    torch.where(
+                        complete,
+                        input_positions - 1,
+                        torch.zeros_like(input_positions),
+                    )
+                )
+
+            compressor_group = self._publish_task(
+                shared,
+                "c2:compressor",
+                self._c2_complete_mask,
+                DeviceMetadataStage.COMPRESSOR,
+                build_c2_metadata,
+            )
+            if compressor_group is not self._c2_complete_mask:
+                raise RuntimeError("V4.1 compressor metadata must have one owner")
+            c2_complete_mask = self._c2_complete_mask[:num_input_tokens]
+            c2_current_state_slots = self._c2_current_state_slots[:num_input_tokens]
+            c2_previous_state_slots = self._c2_previous_state_slots[:num_input_tokens]
+            c2_compressed_slots = self._c2_compressed_slots[:num_input_tokens]
+            c2_source_positions = self._c2_source_positions[:num_input_tokens]
+            c2_metadata_group_id = id(self._c2_complete_mask)
         return DeepseekV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
             slot_mapping=slots,
@@ -747,10 +1101,10 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             positions=positions,
             cos=cos,
             sin=sin,
-            num_actual_tokens=int(getattr(common, "num_actual_tokens", slots.shape[0])),
-            num_input_tokens=int(getattr(common, "num_input_tokens", slots.shape[0])),
+            num_actual_tokens=num_actual_tokens,
+            num_input_tokens=num_input_tokens,
             num_reqs=num_reqs,
-            num_actual_reqs=num_reqs,
+            num_actual_reqs=num_actual_reqs,
             num_decodes=num_decodes,
             num_decode_tokens=num_decode_tokens,
             num_prefills=num_prefills,
@@ -763,6 +1117,15 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             causal=getattr(common, "causal", True),
             ori_win_left=max(0, window_size - 1),
             ori_win_right=0,
+            smla_metadata=smla_metadata,
+            qli_metadata=qli_metadata,
+            cmp_residual=cmp_residual_buffer,
+            c2_complete_mask=c2_complete_mask,
+            c2_current_state_slots=c2_current_state_slots,
+            c2_previous_state_slots=c2_previous_state_slots,
+            c2_compressed_slots=c2_compressed_slots,
+            c2_source_positions=c2_source_positions,
+            c2_metadata_group_id=c2_metadata_group_id,
             **coordinates,
         )
 
@@ -776,7 +1139,7 @@ class DeepseekV41CacheBackend(AttentionBackend):
 
     @staticmethod
     def get_impl_cls():
-        raise NotImplementedError("V4.1 sparse-attention execution is not implemented yet")
+        return DeepseekV41EagerAttentionImpl
 
     @staticmethod
     def get_builder_cls():
