@@ -20,6 +20,7 @@ from vllm_ascend.attention.dsa_v41 import (
 )
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.core.deepseek_v41 import (
+    STATE_RING_ROWS,
     DeepseekV41CompressorStateSpec,
     DeepseekV41FullSpec,
     DeepseekV41IndexerSpec,
@@ -85,15 +86,15 @@ class DeepseekV41Topology:
 class DeepseekV41SharedAttentionState:
     """Per-forward handoff between index sources and their consumer layers."""
 
-    def __init__(self):
-        self.topk_indices = None
-        self.candidates = None
-        self.smla_metadata = {}
+    def __init__(self, topk_indices, candidates):
+        self.topk_indices = topk_indices
+        self.candidates = candidates
 
     def reset(self):
-        self.topk_indices = None
-        self.candidates = None
-        self.smla_metadata.clear()
+        # Source layers overwrite the active rows before any consumer reads
+        # them. Keeping the storage intact avoids replay depending on Python
+        # state mutation and preserves a fixed address for ACL Graph.
+        return None
 
 
 def _as_int_tuple(config: Any, name: str) -> tuple[int, ...]:
@@ -236,11 +237,10 @@ def build_v41_cache_specs(config: Any, vllm_config: Any, prefix: str = "model"):
         )
         if role.compress_ratio == 2:
             specs[f"{attn_prefix}.compressor.state_cache"] = DeepseekV41CompressorStateSpec(
-                block_size=16,
+                block_size=STATE_RING_ROWS,
                 num_kv_heads=1,
                 head_size=2 * width,
                 dtype=torch.float32,
-                sliding_window=2,
             )
     return specs
 
@@ -531,7 +531,19 @@ class DeepseekV41Model(DeepseekV4Model):
         # V4.1 collapses with the last block's ffn_pre; it has no hc_head
         # projection in the checkpoint.
         del self.hc_head_fn, self.hc_head_base, self.hc_head_scale, self.hc_norm
-        self.shared_attention_state = DeepseekV41SharedAttentionState()
+        topology = build_layer_plan(self.config)
+        max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
+        candidate_buffer = torch.full(
+            (max_tokens, 1, topology.candidate_topk_blocks),
+            -1,
+            dtype=torch.int32,
+            device=self.topk_indices_buffer.device,
+        )
+        self.candidate_indices_buffer = candidate_buffer
+        self.shared_attention_state = DeepseekV41SharedAttentionState(
+            self.topk_indices_buffer,
+            candidate_buffer,
+        )
         for layer in self.layers:
             if isinstance(layer, DeepseekV41DecoderLayer):
                 layer.self_attn.shared_state = self.shared_attention_state

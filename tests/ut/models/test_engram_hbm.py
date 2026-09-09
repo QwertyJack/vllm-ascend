@@ -26,6 +26,8 @@ def load_module(name):
 
 
 hbm = load_module("engram_hbm")
+hash_mod = load_module("engram_hash")
+gate = load_module("engram_gate").engram_gate
 
 
 def _worker(rank, rendezvous):
