@@ -33,7 +33,10 @@ from vllm_ascend.core.deepseek_v41 import (
     DeepseekV41IndexerSpec,
     DeepseekV41SWASpec,
 )
-from vllm_ascend.ops.rope_dsv4 import get_cos_and_sin_dsa
+from vllm_ascend.ops.rope_dsv4 import (
+    get_cos_and_sin_dsa,
+    get_full_cos_and_sin_dsa_for_layer,
+)
 from vllm_ascend.worker.device_metadata import (
     DeviceMetadataStage,
     DeviceMetadataTask,
@@ -137,6 +140,8 @@ class DeepseekV41Metadata(AttentionMetadata):
     c2_previous_state_slots: torch.Tensor | None = None
     c2_compressed_slots: torch.Tensor | None = None
     c2_source_positions: torch.Tensor | None = None
+    c2_source_cos: torch.Tensor | None = None
+    c2_source_sin: torch.Tensor | None = None
     c2_metadata_group_id: int | None = None
 
 
@@ -504,7 +509,15 @@ class DeepseekV41EagerAttentionImpl:
         )
         return q.to(hidden_states.dtype), qr, kv.squeeze(1)
 
-    def _write_compressed_source(self, attn, hidden_states, positions, metadata):
+    def _write_compressed_source(
+        self,
+        attn,
+        hidden_states,
+        positions,
+        cos,
+        sin,
+        metadata,
+    ):
         compressor = attn.compressor
         if compressor is None or metadata.compressor is None or metadata.indexer is None:
             raise RuntimeError("V4.1 KV source is missing compressor or source metadata")
@@ -514,7 +527,11 @@ class DeepseekV41EagerAttentionImpl:
         if ratio == 1:
             latent = compressor(hidden_states, 0)
             completed = torch.ones_like(positions, dtype=torch.bool)
-            source_positions = positions
+            # C1 source positions are the current token positions. Reuse the
+            # query RoPE selected by the SWA metadata builder instead of
+            # indexing the global table a second time.
+            source_cos = cos
+            source_sin = sin
             index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
             long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
         else:
@@ -534,6 +551,8 @@ class DeepseekV41EagerAttentionImpl:
             current_slots = state_metadata.c2_current_state_slots
             previous_slots = state_metadata.c2_previous_state_slots
             source_positions = state_metadata.c2_source_positions
+            source_cos = state_metadata.c2_source_cos
+            source_sin = state_metadata.c2_source_sin
             if completed is not None and state_metadata.c2_metadata_group_id is not None:
                 wait_for_device_metadata(
                     DeviceMetadataStage.COMPRESSOR,
@@ -541,7 +560,14 @@ class DeepseekV41EagerAttentionImpl:
                 )
             if any(
                 value is None
-                for value in (completed, current_slots, previous_slots, source_positions)
+                for value in (
+                    completed,
+                    current_slots,
+                    previous_slots,
+                    source_positions,
+                    source_cos,
+                    source_sin,
+                )
             ):
                 completed = positions.remainder(ratio) == ratio - 1
                 current_slots = state_metadata.slot_mapping[: positions.shape[0]].long()
@@ -553,10 +579,15 @@ class DeepseekV41EagerAttentionImpl:
                 source_positions = torch.where(
                     completed, positions + 1 - ratio, torch.zeros_like(positions)
                 )
+                fallback_cos, fallback_sin = get_cos_and_sin_dsa(source_positions)
+                source_cos = fallback_cos[attn.rotary_emb.layername]
+                source_sin = fallback_sin[attn.rotary_emb.layername]
             completed = completed[: positions.shape[0]]
             current_slots = current_slots[: positions.shape[0]].long().clamp_min(0)
             previous_slots = previous_slots[: positions.shape[0]].long().clamp_min(0)
             source_positions = source_positions[: positions.shape[0]]
+            source_cos = source_cos[: positions.shape[0]]
+            source_sin = source_sin[: positions.shape[0]]
             current = gather_cache_rows(state_cache, current_slots)
             previous = gather_cache_rows(state_cache, previous_slots)
             pair = torch.stack((previous, current), 1)
@@ -568,9 +599,6 @@ class DeepseekV41EagerAttentionImpl:
             index_slots = indexer_metadata.cache.slot_mapping[: positions.shape[0]]
             long_slots = compressor_metadata.cache.slot_mapping[: positions.shape[0]]
 
-        source_cos, source_sin = get_cos_and_sin_dsa(source_positions)
-        source_cos = source_cos[attn.rotary_emb.layername]
-        source_sin = source_sin[attn.rotary_emb.layername]
         if attn.indexer is None:
             raise RuntimeError("V4.1 KV source is missing its indexer")
         attn.indexer.update_keys(
@@ -752,7 +780,14 @@ class DeepseekV41EagerAttentionImpl:
             kv,
         )
         if self.role.is_kv_source:
-            self._write_compressed_source(attn, hidden_states, positions, metadata)
+            self._write_compressed_source(
+                attn,
+                hidden_states,
+                positions,
+                cos,
+                sin,
+                metadata,
+            )
         compressed_indices = self._select_sparse_indices(
             attn, hidden_states, qr, positions, cos, sin, metadata
         )
@@ -808,6 +843,32 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         self._c2_source_positions = torch.zeros(
             max_tokens, dtype=torch.int64, device=device
         )
+        text_config = vllm_config.model_config.hf_text_config
+        rope_dim = int(
+            _config_value(
+                text_config,
+                "qk_rope_head_dim",
+                _config_value(text_config, "head_dim"),
+            )
+        )
+        c2_rope_rows = (
+            max_tokens
+            if self._supports_device_ops
+            and isinstance(kv_cache_spec, DeepseekV41CompressorStateSpec)
+            else 0
+        )
+        self._c2_source_cos = torch.ones(
+            (c2_rope_rows, 1, 1, rope_dim),
+            dtype=torch.float32,
+            device=device,
+        )
+        self._c2_source_sin = torch.zeros_like(self._c2_source_cos)
+        self._c2_rope_layer_names = tuple(
+            name.removesuffix(".compressor.state_cache") + ".attn"
+            for name in layer_names
+            if name.endswith(".compressor.state_cache")
+        )
+        self._c2_full_source_rope: tuple[torch.Tensor, torch.Tensor] | None = None
         self._device_metadata_enabled = False
         self._device_metadata_tasks: tuple[DeviceMetadataTask, ...] = ()
 
@@ -832,6 +893,24 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
 
     def enable_device_metadata(self) -> None:
         self._device_metadata_enabled = True
+        if isinstance(self.kv_cache_spec, DeepseekV41CompressorStateSpec):
+            if not self._c2_rope_layer_names:
+                raise RuntimeError(
+                    "V4.1 compressor-state builder has no source RoPE layer"
+                )
+            source_rope = get_full_cos_and_sin_dsa_for_layer(
+                self._c2_rope_layer_names[0]
+            )
+            for rope_layer_name in self._c2_rope_layer_names[1:]:
+                other_rope = get_full_cos_and_sin_dsa_for_layer(rope_layer_name)
+                if any(
+                    other.data_ptr() != source.data_ptr()
+                    for other, source in zip(other_rope, source_rope)
+                ):
+                    raise RuntimeError(
+                        "V4.1 ratio-2 source layers must share one RoPE table"
+                    )
+            self._c2_full_source_rope = source_rope
 
     def take_device_metadata_tasks(self) -> tuple[DeviceMetadataTask, ...]:
         tasks = self._device_metadata_tasks
@@ -1043,6 +1122,8 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
         c2_previous_state_slots = None
         c2_compressed_slots = None
         c2_source_positions = None
+        c2_source_cos = None
+        c2_source_sin = None
         c2_metadata_group_id = None
         if cache_kind == "compressor_state" and getattr(common, "positions", None) is not None:
             # ``slots`` is the authoritative plane view. On NPU it aliases the
@@ -1050,6 +1131,14 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             # remains the caller-owned tensor.
             current_slots = slots[:num_input_tokens]
             input_positions = common.positions[:num_input_tokens].long()
+            if self._supports_device_ops:
+                if self._c2_full_source_rope is None:
+                    raise RuntimeError(
+                        "V4.1 source RoPE buffers were not initialized"
+                    )
+                full_source_cos, full_source_sin = self._c2_full_source_rope
+            else:
+                full_source_cos = full_source_sin = None
 
             def build_c2_metadata() -> None:
                 complete = input_positions.remainder(2) == 1
@@ -1075,6 +1164,27 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
                         torch.zeros_like(input_positions),
                     )
                 )
+                if full_source_cos is not None and full_source_sin is not None:
+                    gather_idx = self._c2_source_positions[
+                        :num_input_tokens
+                    ].reshape(-1, 1, 1, 1).expand(
+                        num_input_tokens,
+                        1,
+                        1,
+                        full_source_cos.shape[-1],
+                    )
+                    torch.gather(
+                        full_source_cos,
+                        0,
+                        gather_idx,
+                        out=self._c2_source_cos[:num_input_tokens],
+                    )
+                    torch.gather(
+                        full_source_sin,
+                        0,
+                        gather_idx,
+                        out=self._c2_source_sin[:num_input_tokens],
+                    )
 
             compressor_group = self._publish_task(
                 shared,
@@ -1090,6 +1200,9 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             c2_previous_state_slots = self._c2_previous_state_slots[:num_input_tokens]
             c2_compressed_slots = self._c2_compressed_slots[:num_input_tokens]
             c2_source_positions = self._c2_source_positions[:num_input_tokens]
+            if self._supports_device_ops:
+                c2_source_cos = self._c2_source_cos[:num_input_tokens]
+                c2_source_sin = self._c2_source_sin[:num_input_tokens]
             c2_metadata_group_id = id(self._c2_complete_mask)
         return DeepseekV41Metadata(
             block_table=common.block_table_tensor[:num_reqs],
@@ -1125,6 +1238,8 @@ class DeepseekV41MetadataBuilder(AttentionMetadataBuilder[DeepseekV41Metadata]):
             c2_previous_state_slots=c2_previous_state_slots,
             c2_compressed_slots=c2_compressed_slots,
             c2_source_positions=c2_source_positions,
+            c2_source_cos=c2_source_cos,
+            c2_source_sin=c2_source_sin,
             c2_metadata_group_id=c2_metadata_group_id,
             **coordinates,
         )
