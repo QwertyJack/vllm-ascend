@@ -119,7 +119,7 @@ def test_twelve_groups_share_four_layer_slots(config, runtime):
     original = collect_specs(runtime)
     uniform = group_cache_specs(original)
     assert [len(g.kv_cache_specs) for g in uniform] == [8, 3] + [4] * 10
-    assert [g.block_size for g in uniform] == [64, 16] + [64] * 10
+    assert [g.block_size for g in uniform] == [64, 32] + [64] * 10
     groups = make_cache_groups(uniform)
     specs = {n: s for g in uniform for n, s in g.kv_cache_specs.items()}
     assert all(s.page_size_padded is None for s in original.values())
@@ -306,8 +306,8 @@ def test_model_registration_and_binding(runtime):
     assert all(module.kv_cache[0].numel() == 0 for module in context.values())
     state = context["language_model.model.layers.2.self_attn.compressor.state_cache"]
     assert state is context["language_model.model.layers.2.self_attn.compressor.state_cache"]
-    assert state.spec.sliding_window == 2
-    assert state.spec.storage_block_size == 16
+    assert not state.spec.prefix_cacheable
+    assert state.spec.storage_block_size == 32
     owned_names = [name for name, module in modules.named_modules() if hasattr(module, "kv_cache")]
     assert len(owned_names) == 51
 
@@ -341,7 +341,8 @@ def test_full_decode_only_runtime_is_supported(runtime):
     validate_cache_runtime(runtime)
 
 
-def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtime):
+@pytest.mark.parametrize("full_graph_mode", [False, True])
+def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtime, full_graph_mode):
     spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
     builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
     common = SimpleNamespace(
@@ -360,16 +361,28 @@ def test_c2_builder_keeps_fixed_rows_for_mixed_parity_and_padding(config, runtim
         is_prefilling=torch.tensor([False, False, False]),
     )
 
-    metadata = builder.build(0, common, num_actual_reqs=2)
+    metadata = builder.build(0, common, num_actual_reqs=2, full_graph_mode=full_graph_mode)
 
     assert metadata.num_actual_reqs == 2
     assert metadata.seq_lens.tolist() == [3, 4, 0]
     assert metadata.c2_complete_mask.tolist() == [False, True, False]
-    assert metadata.c2_current_state_slots.tolist() == [10, 11, 0]
-    assert metadata.c2_previous_state_slots.tolist() == [10, 10, 0]
-    assert metadata.c2_compressed_slots.tolist() == [-1, 5, -1]
+    assert metadata.c2_ring_metadata.tolist() == [[2, 3, 0], [1, 1, 0], [0, 1, 2], [0, 1, 2], [1, 2, 0]]
+    assert metadata.slot_mapping.tolist() == [-1, -1, -1]
     assert metadata.c2_source_positions.tolist() == [0, 2, 0]
     assert metadata.c2_metadata_group_id == id(builder._c2_complete_mask)
+    pointer = metadata.c2_ring_metadata.data_ptr()
+    common.seq_lens = torch.tensor([4, 5, 8])
+    common.seq_lens_cpu = common.seq_lens
+    common.positions = torch.tensor([3, 4, 0])
+    common.block_table_tensor = torch.tensor([[7], [3], [0]])
+    replay = builder.build(0, common, num_actual_reqs=2, full_graph_mode=full_graph_mode)
+    assert replay.c2_ring_metadata.data_ptr() == pointer
+    assert replay.c2_complete_mask.tolist() == [True, False, False]
+    assert replay.c2_ring_metadata[4].tolist() == [7, 3, 0]
+    idle = builder.build(0, common, num_actual_reqs=2, skip_ring_state_update=True)
+    assert idle.c2_ring_metadata[1].tolist() == [0, 0, 0]
+    assert idle.c2_ring_metadata[4].tolist() == [0, 0, 0]
+    assert not idle.c2_complete_mask.any()
 
 
 def test_scatter_cache_redirects_invalid_rows_to_null_row():
@@ -473,7 +486,7 @@ def test_sparse_indices_are_padded_for_native_mla():
     assert padded.tolist() == [[[2, 7, -1, -1]], [[1, -1, -1, -1]]]
 
 
-def test_state_metadata_keeps_original_token_slots(config, runtime):
+def test_state_metadata_disables_ordinary_token_slots(config, runtime):
     specs = collect_specs(runtime)
     spec = specs["model.layers.2.self_attn.compressor.state_cache"]
     builder = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu"))
@@ -494,9 +507,9 @@ def test_state_metadata_keeps_original_token_slots(config, runtime):
     )
     metadata = builder.build(0, common)
     assert metadata.is_compressor_state
-    assert metadata.slot_mapping is slots
+    assert (metadata.slot_mapping == -1).all()
     assert metadata.compress_ratio == 1
-    assert metadata.storage_block_size == 16
+    assert metadata.storage_block_size == 32
     assert metadata.max_query_len == 2
     assert metadata.max_seq_len == 17
     assert metadata.start_pos.tolist() == [15]
@@ -648,15 +661,14 @@ def test_merged_metadata_preserves_nonconsecutive_block_ids(runtime, end):
     torch.testing.assert_close(common.slot_mapping, original_slots)
 
 
-@pytest.mark.parametrize("end", [15, 16, 17])
+@pytest.mark.parametrize("end", [15, 16, 17, 31, 32, 33, 127, 128, 129, 255, 256, 257])
 def test_state_boundary_mapping_with_padded_pages(runtime, end):
     group = group_cache_specs(collect_specs(runtime))[1]
-    table = torch.tensor([[7, 3]], dtype=torch.int32)
     positions = torch.arange(end - 2, end)
-    original = table[0, positions // 16] * 16 + positions % 16
     common = SimpleNamespace(
-        slot_mapping=original,
-        block_table_tensor=table,
+        slot_mapping=torch.full((2,), -1),
+        block_table_tensor=torch.tensor([[7]], dtype=torch.int32),
+        positions=positions,
         query_start_loc=torch.tensor([0, 2]),
         query_start_loc_cpu=torch.tensor([0, 2]),
         seq_lens=torch.tensor([end]),
@@ -670,9 +682,10 @@ def test_state_boundary_mapping_with_padded_pages(runtime, end):
     )
     spec = next(iter(group.kv_cache_specs.values()))
     metadata = DeepseekV41MetadataBuilder(spec, [], runtime, torch.device("cpu")).build(0, common)
-    torch.testing.assert_close(metadata.slot_mapping, original)
-    assert metadata.storage_block_size == metadata.logical_block_size == 16
-    assert metadata.cache_seq_lens.tolist() == [end]
+    assert metadata.slot_mapping.tolist() == [-1, -1]
+    assert metadata.storage_block_size == metadata.logical_block_size == 32
+    assert metadata.c2_ring_metadata[:, 0].tolist() == [end - 2, 2, 0, 0, 7]
+    assert metadata.c2_source_positions.tolist() == [int(p - 1) if p % 2 else 0 for p in positions]
 
 
 def test_actual_attention_parameter_ownership(config, runtime):
@@ -694,43 +707,137 @@ def test_compressor_chunk_boundary_matches_vector_reference(config, chunks):
     kv = compressor.wkv(x.float())[:6].reshape(3, 2, 8)
     gate = compressor.wgate(x.float())[:6].reshape(3, 2, 8)
     expected = compressor.norm((kv * gate.softmax(dim=1)).sum(dim=1).to(x.dtype))
-    # Each successive group occupies another page. Noncontiguous physical IDs
-    # and chunks spanning those pages catch the old circular-buffer addressing.
-    state = torch.full((6, 2, 16), float("nan"), dtype=torch.float32)
-    block_table = [4, 1, 5, 2]
+    state = torch.full((6, 32, 16), float("nan"), dtype=torch.float32)
+    block_table = [4]
     actual = []
     start = 0
     for size in chunks:
         actual.append(compressor(x[start : start + size], start, state, block_table))
         start += size
     torch.testing.assert_close(torch.cat(actual), expected)
-    torch.testing.assert_close(state[2, 0, :8], compressor.wkv(x[-1:].float())[0])
+    torch.testing.assert_close(state[4, 6, :8], compressor.wkv(x[-1:].float())[0])
 
 
-def test_state_uses_swa_memory_and_block_table_rules(config, runtime):
-    from vllm_ascend.core.deepseek_v41 import DeepseekV41CompressorStateSpec
-    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+@pytest.mark.parametrize("num_tokens", [1, 2, 3, 5])
+@pytest.mark.parametrize("start", [0, 1])
+def test_ring_source_masks_both_fused_store_coordinates(monkeypatch, num_tokens, start):
+    from vllm_ascend.attention import dsa_v41
+
+    positions = torch.arange(start, start + num_tokens)
+    completed = positions.remainder(2) == 1
+    slots = torch.tensor([[7, 63], [19, 0], [19, 1], [3, 0], [3, 1]], dtype=torch.int32)[:num_tokens]
+    original_slots = slots.clone()
+    rope = torch.zeros(num_tokens, 1, 2)
+    state = SimpleNamespace(
+        c2_ring_metadata=torch.zeros(5, 1, dtype=torch.int32),
+        c2_metadata_group_id="ring",
+        c2_complete_mask=completed,
+        c2_source_cos=rope,
+        c2_source_sin=rope,
+    )
+    events = []
+
+    def pool(kv, score, metadata):
+        assert kv.dtype == score.dtype == torch.float32
+        assert metadata is state
+        events.append("pool")
+        return kv.to(torch.bfloat16)
+
+    expected = slots.clone()
+    expected[~completed] = -1
+
+    def update_keys(latent, coordinates, cos, sin):
+        events.append("index")
+        torch.testing.assert_close(coordinates, expected)
+
+    def store(cache, coordinates, values):
+        events.append("kv")
+        torch.testing.assert_close(coordinates, expected)
+
+    monkeypatch.setattr(dsa_v41, "wait_for_device_metadata", lambda *args: events.append("wait"))
+    monkeypatch.setattr(dsa_v41, "scatter_cache_v2", store)
+    monkeypatch.setattr(torch.ops._C_ascend, "inplace_partial_rotary_mul", lambda *args, **kwargs: None, raising=False)
+    attn = SimpleNamespace(
+        compressor=SimpleNamespace(wkv=lambda x: x, wgate=lambda x: x, pool_projected=pool),
+        indexer=SimpleNamespace(update_keys=update_keys),
+        long_kv_cache=SimpleNamespace(kv_cache=[torch.empty(0)]),
+        head_dim=8,
+        nope_head_dim=6,
+    )
+    cache = SimpleNamespace(slot_mapping=slots)
+    metadata = SimpleNamespace(
+        compressor=SimpleNamespace(cache=cache, state=state),
+        indexer=SimpleNamespace(cache=cache),
+    )
+    DeepseekV41EagerAttentionImpl._write_compressed_source(
+        SimpleNamespace(role=SimpleNamespace(compress_ratio=2)),
+        attn,
+        torch.zeros(num_tokens, 8, dtype=torch.bfloat16),
+        positions,
+        rope,
+        rope,
+        metadata,
+    )
+    assert events == ["wait", "pool", "index", "kv"]
+    torch.testing.assert_close(slots, original_slots)
+
+
+def test_state_uses_one_ring_page_and_block_table_entry(config, runtime):
+    from vllm_ascend.core.circular_buffer import AscendCircularBufferSpec
 
     spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
-    assert isinstance(spec, AscendSlidingWindowMLASpec)
-    assert isinstance(spec, DeepseekV41CompressorStateSpec)
-    assert spec.sliding_window == 2
-    assert spec.compress_ratio == 1
-    assert spec.storage_block_size == 16
-    assert spec.page_size_bytes == 16 * 16 * 4
-    assert spec.max_num_blocks_per_req(runtime, 1024) == 64
-    runtime.max_in_flight_tokens = 128
-    runtime.model_config.max_model_len = 1024
-    expected_pages = spec.max_admission_blocks_per_request(128, 1024)
-    assert spec.max_memory_usage_bytes(runtime) == expected_pages * spec.page_size_bytes
-    assert expected_pages > 1
-    assert spec.sliding_window != config["sliding_window"]
+    assert isinstance(spec, AscendCircularBufferSpec)
+    assert spec.compress_ratio == 1 and not spec.prefix_cacheable
+    assert spec.storage_block_size == 32
+    assert spec.page_size_bytes == 32 * 16 * 4
+    assert spec.max_num_blocks_per_req(runtime, 1024) == 1
+    assert spec.max_memory_usage_bytes(runtime) == spec.page_size_bytes
+
+
+@pytest.mark.parametrize("change", [{"dtype": torch.bfloat16}, {"block_size": 16}, {"compress_ratio": 2}])
+def test_state_spec_rejects_precision_or_capacity_changes(runtime, change):
+    spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
+    with pytest.raises(ValueError, match="32-row FP32"):
+        replace(spec, **change)
+
+
+def test_ring_view_rejects_unrepresented_page_padding(runtime):
+    spec = collect_specs(runtime)["model.layers.2.self_attn.compressor.state_cache"]
+    stride = 2 * spec.page_size_bytes
+    with pytest.raises(ValueError, match="fill its slot"):
+        reshape_cache(torch.zeros(3 * stride, dtype=torch.uint8), spec, num_blocks=3, offset=0, block_stride=stride)
+
+
+def test_projected_model_entry_keeps_fp32_state_and_existing_norm(config, monkeypatch):
+    compressor = DeepseekV41Compressor(config, 2)
+    compressor.register_buffer("_ring_pooled", torch.empty(4, 8, dtype=torch.bfloat16), persistent=False)
+    compressor._ring_num_cores = 1
+    state = torch.zeros(3, 32, 1, 16, dtype=torch.float32)
+    compressor.state_cache = SimpleNamespace(kv_cache=[state])
+    metadata = SimpleNamespace(c2_ring_metadata=torch.zeros(5, 1, dtype=torch.int32), max_query_len=2)
+    pooled = torch.randn(2, 8, dtype=torch.bfloat16)
+    expected = compressor.norm(pooled).clone()
+    pointer = compressor._ring_pooled.data_ptr()
+
+    def kernel(kv, scores, state_view, controls, out, **kwargs):
+        assert kv.dtype == scores.dtype == state_view.dtype == torch.float32
+        assert state_view.data_ptr() == state.data_ptr()
+        assert controls is metadata.c2_ring_metadata
+        assert out.data_ptr() == pointer and out.dtype == torch.bfloat16
+        out.copy_(pooled)
+        return out
+
+    monkeypatch.setattr("vllm_ascend.ops.triton.compressor.compressor_triton.compressor_from_projected", kernel)
+    hidden = torch.randn(2, 16, dtype=torch.bfloat16)
+    actual = compressor.pool_projected(compressor.wkv(hidden.float()), compressor.wgate(hidden.float()), metadata)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert compressor.wkv.weight.dtype == compressor.wgate.weight.dtype == torch.float32
 
 
 @torch.inference_mode()
 def test_compressor_rejects_missing_previous_state_page(config):
     compressor = DeepseekV41Compressor(config, 2)
-    state = torch.full((3, 2, 16), float("nan"), dtype=torch.float32)
+    state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     with pytest.raises(ValueError, match="absent/null"):
         compressor(torch.zeros(1, 16, dtype=torch.bfloat16), 1, state, [0])
 
@@ -738,7 +845,7 @@ def test_compressor_rejects_missing_previous_state_page(config):
 @torch.inference_mode()
 def test_state_page_reuse_does_not_require_request_reset(config):
     compressor = DeepseekV41Compressor(config, 2)
-    state = torch.full((3, 2, 16), float("nan"), dtype=torch.float32)
+    state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     x = torch.randn(2, 16, dtype=torch.bfloat16)
     expected = compressor(x, 0, state, [1]).clone()
     state[1].fill_(12345)
@@ -746,10 +853,10 @@ def test_state_page_reuse_does_not_require_request_reset(config):
     torch.testing.assert_close(actual, expected)
 
 
-def test_state_registers_standard_sliding_window_manager(monkeypatch):
-    from vllm.v1.core.single_type_kv_cache_manager import SlidingWindowManager
+def test_state_registers_circular_manager(monkeypatch):
     from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
 
+    from vllm_ascend.core.circular_buffer import AscendCircularBufferManager
     from vllm_ascend.core.deepseek_v41 import DeepseekV41CompressorStateSpec
     from vllm_ascend.core.kv_cache_interface import register_ascend_kv_cache_specs
 
@@ -760,17 +867,13 @@ def test_state_registers_standard_sliding_window_manager(monkeypatch):
 
     monkeypatch.setattr(KVCacheSpecRegistry, "register", record)
     register_ascend_kv_cache_specs()
-    assert registrations[DeepseekV41CompressorStateSpec] is SlidingWindowManager
-    manager = SimpleNamespace(sliding_window=2, extra_retained_tokens=0)
-    for computed in (1, 63, 64, 65, 128, 129):
-        # At the next query, the immediately previous token is never skipped.
-        assert SlidingWindowManager.get_num_skipped_tokens(manager, computed) == computed - 1
+    assert registrations[DeepseekV41CompressorStateSpec] is AscendCircularBufferManager
 
 
 @torch.inference_mode()
 def test_interleaved_request_state_isolation(config):
     compressor = DeepseekV41Compressor(config, 2)
-    state = torch.full((3, 2, 16), float("nan"), dtype=torch.float32)
+    state = torch.full((3, 32, 16), float("nan"), dtype=torch.float32)
     first = torch.randn(2, 16, dtype=torch.bfloat16)
     second = torch.randn(2, 16, dtype=torch.bfloat16)
     compressor(first[:1], 0, state, [1])
