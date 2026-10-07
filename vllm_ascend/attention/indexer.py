@@ -261,9 +261,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         use_reshape_optim = self._use_c8_reshape_optim()
         if use_reshape_optim:
             assert indexer_attn_metadata is not None
+            # StoreKVBlock copies bytes; its prototype does not accept FP8.
+            # Reinterpret both sides, never numerically cast quantized keys.
             torch.ops._C_ascend.store_kv_block(
-                k_li,
-                indexer_k_cache,
+                k_li.view(torch.int8) if k_li.dtype == torch.float8_e4m3fn else k_li,
+                indexer_k_cache.view(torch.int8)
+                if indexer_k_cache.dtype == torch.float8_e4m3fn
+                else indexer_k_cache,
                 indexer_attn_metadata.group_len,
                 indexer_attn_metadata.group_key_idx,
                 indexer_attn_metadata.group_key_cache_idx,
@@ -281,8 +285,12 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             if use_reshape_optim:
                 assert indexer_attn_metadata is not None
                 torch.ops._C_ascend.store_kv_block(
-                    k_li_scale,
-                    indexer_scale_cache,
+                    # FP8 indexer scales remain FP32. Use a 16-bit storage
+                    # view (two half words per scale), not FP16 conversion.
+                    k_li_scale.view(torch.float16) if k_li_scale.dtype == torch.float32 else k_li_scale,
+                    indexer_scale_cache.view(torch.float16)
+                    if indexer_scale_cache.dtype == torch.float32
+                    else indexer_scale_cache,
                     indexer_attn_metadata.group_len,
                     indexer_attn_metadata.group_key_idx,
                     indexer_attn_metadata.group_key_cache_idx,

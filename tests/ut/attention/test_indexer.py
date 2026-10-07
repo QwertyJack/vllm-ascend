@@ -19,6 +19,33 @@ from vllm_ascend.attention.indexer import (
 _KERNEL_BLOCK_SIZE = 128
 
 
+@patch("vllm_ascend.attention.indexer.torch.ops._C_ascend.store_kv_block", create=True)
+def test_store_kv_fp8_keys_and_fp32_scales_use_byte_exact_views(store):
+    key = torch.arange(384, dtype=torch.float32).reshape(3, 1, 128).to(torch.float8_e4m3fn)
+    scale = torch.tensor([0.3, 1.0, 2.5], dtype=torch.float32).reshape(3, 1, 1)
+    key_cache = torch.zeros((1, 4, 1, 128), dtype=torch.float8_e4m3fn)
+    scale_cache = torch.zeros((1, 4, 1, 1), dtype=torch.float32)
+    indexer = SimpleNamespace(
+        k_cache=SimpleNamespace(kv_cache=(key_cache, scale_cache)),
+        _use_c8_reshape_optim=lambda: True,
+        enable_sparse_li_c8=True,
+    )
+    metadata = SimpleNamespace(group_len=torch.tensor([3], dtype=torch.int32),
+                               group_key_idx=torch.tensor([0], dtype=torch.int32),
+                               group_key_cache_idx=torch.tensor([0], dtype=torch.int32), block_size=4)
+    AscendSFAIndexerBackend.write_cache(indexer, key, scale, torch.arange(3), metadata)
+    assert store.call_count == 2
+    key_view, key_cache_view = store.call_args_list[0].args[:2]
+    scale_view, scale_cache_view = store.call_args_list[1].args[:2]
+    assert key_view.dtype == key_cache_view.dtype == torch.int8
+    assert scale_view.dtype == scale_cache_view.dtype == torch.float16
+    assert key_view.data_ptr() == key.data_ptr() and key_cache_view.data_ptr() == key_cache.data_ptr()
+    assert scale_view.data_ptr() == scale.data_ptr() and scale_cache_view.data_ptr() == scale_cache.data_ptr()
+    assert torch.equal(key_view.view(torch.uint8), key.view(torch.uint8))
+    assert torch.equal(scale_view.view(torch.uint8), scale.view(torch.uint8))
+    assert scale_view.shape == (3, 1, 2)  # Two half words, not a lossy half cast.
+
+
 def _make_builder(
     pcp_size: int = 1,
     dcp_size: int = 1,
