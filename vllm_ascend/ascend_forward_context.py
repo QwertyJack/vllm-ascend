@@ -391,6 +391,9 @@ def select_moe_comm_method(
     if not is_moe_model(vllm_config):
         return None
 
+    if getattr(get_ascend_config(), "moe_force_allgather", False) is True:
+        return MoECommType.ALLGATHER
+
     mc2_tokens_capacity = get_mc2_tokens_capacity()
     moe_comm_policy = get_current_hardware_profile().moe_comm_policy
     lora_config = getattr(vllm_config, "lora_config", None)

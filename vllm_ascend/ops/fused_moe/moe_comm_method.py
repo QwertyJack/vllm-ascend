@@ -218,6 +218,7 @@ class AllGatherCommImpl(MoECommMethod):
             top_k=self.moe_config.experts_per_token,
             num_experts=self.moe_config.num_experts,
             num_local_experts=self.moe_config.num_local_experts,
+            fp32_combine=get_ascend_config().moe_allgather_fp32_combine is True,
         )
 
     def _get_prepare_finalize(self):

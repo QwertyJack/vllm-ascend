@@ -481,6 +481,34 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertEqual(kwargs["quant_mode"], 4)
         self.assertEqual(kwargs["y_dtype"], torch.float8_e4m3fn)
 
+    def test_explicit_zero_disables_mxfp_combine_only(self):
+        data = build_token_dispatch_input_fixture(
+            hidden_states=torch.randn(2, 128, dtype=torch.bfloat16),
+            topk_ids=torch.zeros(2, 1, dtype=torch.int32),
+            topk_weights=torch.ones(2, 1),
+            expert_map=torch.arange(8),
+            quant_type=QuantType.W8A8MXFP,
+            act_quant_type=torch.float8_e4m3fn,
+        )
+        metadata = MoEMC2CombineMetadata(
+            topk_ids=data.topk_ids,
+            topk_weights=data.topk_weights,
+            expert_map=data.routing.expert_map,
+            ep_recv_counts=torch.zeros(8, dtype=torch.int32),
+            tp_recv_counts=torch.zeros(1, dtype=torch.int32),
+            assist_info_for_combine=torch.zeros(2, dtype=torch.int32),
+            expand_scales=None,
+            quant=data.quant,
+        )
+        self.dispatcher.need_shared_expert_args = True
+        self.dispatcher.moe_expert_num = 8
+        for configured, expected in ((None, 4), (0, 0), (2, 2), (4, 4)):
+            self.mock_ascend_config.combine_quant_mode = configured
+            kwargs = self.dispatcher.get_combine_mc_kwargs(data.hidden_states, metadata)
+            self.assertEqual(kwargs["comm_quant_mode"], expected)
+            dispatch_kwargs = self.dispatcher.get_dispatch_mc2_kwargs(data)
+            self.assertEqual(dispatch_kwargs["quant_mode"], 4)
+
     def test_get_dispatch_mc2_kwargs_with_mxfp4_quant(self):
         hidden_states = torch.randn(10, 128)
         topk_weights = torch.randn(10, 1)
@@ -524,7 +552,8 @@ class TestTokenDispatcherWithMC2(TestBase):
         self.assertTrue(output.combine_metadata.quant.dispatch_with_quant)
 
 
-def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
+@patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_dynamic_mx_quant_scale_alg", return_value=0)
+def test_allgather_token_dispatch_quant_mode_without_dynamic_scale(_scale_alg):
     dispatcher = TokenDispatcherWithAllGather(top_k=2, num_experts=128)
     hidden_states = torch.randn(3, 128)
     topk_weights = torch.tensor([[0.7, 0.3], [0.6, 0.4], [0.5, 0.5]])
@@ -571,6 +600,50 @@ def test_allgather_token_dispatch_quant_mode_without_dynamic_scale():
         assert init_kwargs["quant_mode"] == case["expected_quant_mode"]
         assert init_kwargs["act_quant_type"] == case["expected_act_quant_type"]
         assert (output.dynamic_scale is not None) == case["expect_dynamic_scale"]
+
+
+@pytest.mark.parametrize(
+    "scale_alg,prequantized,weight_on_input",
+    [(0, False, False), (1, False, False), (1, True, False), (1, False, True)],
+)
+def test_allgather_mxfp8_dispatch_honors_scale_algorithm(scale_alg, prequantized, weight_on_input):
+    dispatcher = TokenDispatcherWithAllGather(top_k=1, num_experts=2, num_local_experts=2)
+    hidden = torch.randn(2, 64, dtype=torch.bfloat16)
+    quantized = torch.zeros_like(hidden, dtype=torch.float8_e4m3fn)
+    scales = torch.full((2, 2), 127, dtype=torch.uint8)
+    weights = torch.tensor([[0.25], [0.75]])
+    source = quantized if prequantized else hidden
+    token_input = build_token_dispatch_input_fixture(
+        hidden_states=source,
+        topk_weights=weights,
+        topk_ids=torch.tensor([[0], [1]], dtype=torch.int32),
+        pertoken_scale=scales if prequantized else None,
+        apply_router_weight_on_input=weight_on_input,
+        quant_type=QuantType.W8A8MXFP,
+        act_quant_type=torch.float8_e4m3fn,
+    )
+    returned_scale = scales.flip(0)
+    with (
+        patch("vllm_ascend.ops.fused_moe.token_dispatcher.get_dynamic_mx_quant_scale_alg", return_value=scale_alg),
+        patch("torch_npu.npu_dynamic_mx_quant", return_value=(quantized, scales)) as quant,
+        patch(
+            "vllm_ascend.ops.fused_moe.token_dispatcher.DeviceOperator.npu_moe_init_routing",
+            return_value=(quantized, torch.arange(2), torch.ones(2), returned_scale),
+        ) as routing,
+    ):
+        result = dispatcher.token_dispatch(token_input)
+    explicit = scale_alg == 1 and not prequantized
+    if explicit:
+        quant.assert_called_once()
+        expected = hidden * weights.to(hidden.dtype) if weight_on_input else hidden
+        assert torch.equal(quant.call_args.args[0], expected)
+        assert quant.call_args.kwargs == {"dst_type": torch.float8_e4m3fn, "scale_alg": 1}
+    else:
+        quant.assert_not_called()
+    assert routing.call_args.args[0] is (quantized if explicit else source)
+    assert routing.call_args.kwargs["quant_mode"] == (-1 if explicit or prequantized else 3)
+    assert routing.call_args.kwargs["scale"] is (scales if explicit or prequantized else None)
+    assert result.dynamic_scale is returned_scale
 
 
 def test_allgather_token_dispatch_mxfp4_keeps_prequantized_scale():
@@ -1054,3 +1127,38 @@ class TestTokenDispatcherWithAll2AllV(TestBase):
         self.assertIsNotNone(result.group_list)
         self.assertIsNotNone(result.dynamic_scale)
         self.assertEqual(result.group_list_type, 1)
+
+
+@pytest.mark.parametrize("fp32_combine", [False, True])
+@pytest.mark.parametrize("dp_size", [1, 2, 4, 8])
+def test_allgather_combine_preserves_weights_and_reduces_before_cast(fp32_combine, dp_size):
+    states = torch.tensor([[0.123, -0.234]], dtype=torch.bfloat16)
+    weights = torch.tensor([[0.333123]], dtype=torch.float32)
+    metadata = MoEAllGatherCombineMetadata(
+        topk_weights=weights,
+        expanded_row_idx=torch.tensor([0]),
+        restore_shape=states.shape,
+        fp32_combine=fp32_combine,
+    )
+    dispatcher = TokenDispatcherWithAllGather(top_k=1, num_experts=1)
+    target = "vllm_ascend.ops.fused_moe.token_dispatcher"
+    with (
+        patch(
+            target + ".DeviceOperator.npu_moe_token_unpermute",
+            side_effect=lambda **kw: kw["permuted_tokens"] * kw["probs"],
+        ),
+        patch(target + ".tensor_model_parallel_all_reduce", side_effect=lambda x: x * 2) as reduce,
+        patch(target + ".get_dp_group", return_value=SimpleNamespace(world_size=dp_size)),
+    ):
+        result = dispatcher.token_combine(states, metadata)
+    if fp32_combine:
+        expected = states.float() * weights * 2
+        if dp_size == 1:
+            expected = expected.bfloat16()
+        assert reduce.call_args.args[0].dtype == torch.float32
+        reduce.assert_called_once()
+    else:
+        expected = states * weights.bfloat16()
+        reduce.assert_not_called()
+    assert result.dtype == (torch.float32 if fp32_combine and dp_size > 1 else states.dtype)
+    assert torch.equal(result, expected)

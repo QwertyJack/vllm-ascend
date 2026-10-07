@@ -151,6 +151,88 @@ def test_sfa_indexer_backend_contract():
     assert AscendSFAIndexerBackend.get_supported_kernel_block_sizes() == [128]
 
 
+@pytest.mark.parametrize(
+    "model_type,interleave,expected_neox",
+    [("dots3_note", True, False), ("deepseek_v3", None, True), ("glm_moe_dsa", None, False)],
+)
+def test_indexer_rope_layout_follows_text_config(model_type, interleave, expected_neox):
+    text_config = SimpleNamespace()
+    if interleave is not None:
+        text_config.indexer_rope_interleave = interleave
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(model_type=model_type), hf_text_config=text_config),
+        parallel_config=SimpleNamespace(prefill_context_parallel_size=1),
+    )
+    upstream = SimpleNamespace(
+        n_head=2,
+        head_dim=8,
+        topk_tokens=2048,
+        q_lora_rank=4,
+        wq_b=None,
+        wk_weights_proj=None,
+        k_norm=None,
+        softmax_scale=8**-0.5,
+        k_cache=SimpleNamespace(prefix="indexer.k_cache"),
+    )
+    with (
+        patch("vllm_ascend.attention.indexer.get_current_vllm_config", return_value=config),
+        patch("vllm_ascend.attention.indexer.get_ascend_config") as ascend_config,
+        patch("vllm_ascend.attention.indexer.enable_dsa_cp", return_value=False),
+    ):
+        ascend_config.return_value.is_sparse_li_c8_layer.return_value = False
+        indexer = AscendSFAIndexerBackend(upstream, qk_rope_head_dim=4)
+    assert indexer.is_rope_neox_style is expected_neox
+
+
+@pytest.mark.parametrize("rows", [0, 1, 4, 9])
+@pytest.mark.parametrize("fixed_rows", [0, 4])
+def test_indexer_projection_fixed_rows_preserves_output_and_inputs(rows, fixed_rows):
+    backend = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    torch.nn.Module.__init__(backend)
+    backend.fixed_projection_rows = fixed_rows
+    inputs = torch.randn(rows, 5)
+    before = inputs.clone()
+    weight = torch.randn(3, 5)
+    calls = []
+
+    def project(x):
+        calls.append(x.shape[0])
+        return torch.nn.functional.linear(x, weight), None
+
+    backend.wk_weights_proj = project
+    actual = backend._project_key_and_weights(inputs)
+    expected = torch.nn.functional.linear(inputs, weight)
+    torch.testing.assert_close(actual, expected)
+    assert torch.equal(inputs, before)
+    assert calls == ([4] * ((rows + 3) // 4) if fixed_rows and rows else [rows])
+
+
+@pytest.mark.parametrize("neox", [False, True])
+def test_indexer_native_rope_preserves_pair_layout_and_nope(neox):
+    indexer = AscendSFAIndexerBackend.__new__(AscendSFAIndexerBackend)
+    indexer.qk_rope_head_dim, indexer.head_dim = 4, 6
+    indexer.is_rope_neox_style = neox
+    value = torch.arange(24, dtype=torch.float32).reshape(2, 2, 6)
+    cos = torch.tensor([[0.6, 0.8, 0.6, 0.8]]).expand(2, -1)
+    sin = torch.tensor([[0.8, 0.6, 0.8, 0.6]]).expand(2, -1)
+
+    def rotary(x, cosine, sine):
+        first, second = x.chunk(2, dim=-1)
+        return x * cosine + torch.cat((-second, first), -1) * sine
+
+    with (
+        patch("vllm_ascend.attention.indexer.HAS_TRITON", False),
+        patch("torch_npu.npu_rotary_mul", side_effect=rotary),
+    ):
+        actual = indexer._apply_rope(value, cos, sin)
+    first, second = (value[..., :2], value[..., 2:4]) if neox else (value[..., :4:2], value[..., 1:4:2])
+    a = first * cos[:, None, :2] - second * sin[:, None, :2]
+    b = second * cos[:, None, :2] + first * sin[:, None, :2]
+    expected_rope = torch.cat((a, b), -1) if neox else torch.stack((a, b), -1).flatten(-2)
+    torch.testing.assert_close(actual[..., :4], expected_rope)
+    torch.testing.assert_close(actual[..., 4:], value[..., 4:], rtol=0, atol=0)
+
+
 @patch("vllm_ascend.attention.indexer.get_ascend_config")
 @patch("vllm_ascend.attention.indexer.get_cos_and_sin_mla")
 def test_sfa_indexer_metadata_builder_builds_kernel_metadata(mock_cos_sin, mock_get_ascend_config):

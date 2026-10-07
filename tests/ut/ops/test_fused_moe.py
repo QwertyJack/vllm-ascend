@@ -1857,6 +1857,7 @@ def test_runner_selects_sp_multistream_custom_op(
     monkeypatch.setattr(fused_moe_module, "get_dp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", MagicMock())
     monkeypatch.setattr(fused_moe_module, "get_moe_comm_method", MagicMock(return_value=None))
+    monkeypatch.setattr(fused_moe_module, "get_ascend_config", lambda: SimpleNamespace(moe_router_fixed_rows=0))
 
     runner = AscendMoERunner(
         "model.layers.0.mlp",
@@ -2432,6 +2433,58 @@ def test_compute_router_logits_fallback_does_not_cast_unused_input():
     hidden_states.float.assert_not_called()
 
 
+@pytest.mark.parametrize("rows", [0, 1, 4, 9])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
+def test_fixed_router_gemm_preserves_rows_and_uses_fixed_chunks(monkeypatch, rows, dtype):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner.router_fixed_rows = 4
+    runner.gate = SimpleNamespace(weight_fp32=torch.randn(3, 5))
+    hidden = torch.randn(rows, 5, dtype=torch.bfloat16)
+    inputs = hidden if dtype == torch.bfloat16 else torch.randn(rows, 5)
+    original = inputs.clone()
+    dimensions = []
+    linear = F.linear
+
+    def record_linear(x, weight):
+        dimensions.append(x.shape[0])
+        return linear(x, weight)
+
+    monkeypatch.setattr(fused_moe_module.F, "linear", record_linear)
+    output = runner._compute_router_logits(hidden, inputs)
+    assert dimensions == ([4] * ((rows + 3) // 4) if rows else [0])
+    torch.testing.assert_close(output, linear(inputs.float(), runner.gate.weight_fp32))
+    assert torch.equal(inputs, original)
+
+
+def test_fixed_router_gemm_rejects_uncached_gate():
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner.router_fixed_rows = 4
+    runner.gate = SimpleNamespace()
+    with pytest.raises(ValueError, match="pre-cast FP32"):
+        runner._compute_router_logits(torch.empty(1, 5), torch.empty(1, 5))
+
+
+@pytest.mark.parametrize("fixed_rows", [0, 4])
+@pytest.mark.parametrize("rows", [0, 1, 9])
+@pytest.mark.parametrize("rounding_dtype", [None, torch.bfloat16, torch.float32])
+def test_router_logit_rounding_preserves_fp32_activation(fixed_rows, rows, rounding_dtype):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    nn.Module.__init__(runner)
+    runner.router_fixed_rows = fixed_rows
+    runner.gate = SimpleNamespace(
+        weight_fp32=torch.tensor([[1.001, 2.003], [3.007, 4.009]]),
+        router_logit_rounding_dtype=rounding_dtype,
+    )
+    hidden = torch.tensor([[0.5, 1.0]], dtype=torch.bfloat16).expand(rows, -1)
+    output = runner._compute_router_logits(hidden, hidden)
+    exact = F.linear(hidden.float(), runner.gate.weight_fp32)
+    expected = exact if rounding_dtype is None else exact.to(rounding_dtype).float()
+    assert output.dtype == torch.float32
+    assert torch.equal(output, expected)
+
+
 def test_forward_impl_keeps_full_width_input_for_shared_experts(monkeypatch):
     runner = AscendMoERunner.__new__(AscendMoERunner)
     nn.Module.__init__(runner)
@@ -2528,6 +2581,7 @@ def _stub_moe_runner_init(monkeypatch, *, gate=None, shared_experts=None, fused_
     monkeypatch.setattr(fused_moe_module, "get_tp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "get_dp_group", MagicMock(return_value=object()))
     monkeypatch.setattr(fused_moe_module, "setup_moe_comm_method", MagicMock())
+    monkeypatch.setattr(fused_moe_module, "get_ascend_config", lambda: SimpleNamespace(moe_router_fixed_rows=0))
     monkeypatch.setattr(
         fused_moe_module,
         "get_moe_comm_method",
@@ -2748,3 +2802,46 @@ def test_maybe_all_reduce_graph_replay_preserves_shared_and_routed_outputs(
         assert not any("ascend_moe_forward_complete" in str(node.target) for node in graph.graph.nodes)
     finally:
         library._destroy()
+
+
+@pytest.mark.parametrize("comm", [MoECommType.ALLGATHER, MoECommType.MC2])
+def test_fp32_combine_reduces_shared_once_and_skips_final(monkeypatch, runtime_moe_all_reduce, comm):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    runner.layer_name = "test.fp32_combine"
+    runner.moe_config = SimpleNamespace(is_sequence_parallel=False)
+    runner.routed_output_transform = None
+    runner.ascend_shared_experts = None
+    runner.allgather_fp32_combine = True
+    runtime_moe_all_reduce.moe_comm_type = comm
+    runtime_moe_all_reduce.no_compile_layers[runner.layer_name] = runner
+    shared = torch.ones(1, 4, dtype=torch.bfloat16)
+    reduce = MagicMock(side_effect=lambda x: x * 2)
+    monkeypatch.setattr(fused_moe_module, "tensor_model_parallel_all_reduce", reduce)
+    assert runner._fused_output_is_reduced
+    reduced_shared = runner._maybe_reduce_shared_expert_output(shared, False)
+    assert torch.equal(reduced_shared, shared * 2)
+    final = reduced_shared + 1
+    assert runner._maybe_reduce_final_output(final, None, False) is final
+    reduce.assert_called_once_with(shared)
+
+
+@pytest.mark.parametrize(
+    "sp,dp,pcp",
+    [(False, 1, 1), (False, 2, 1), (False, 4, 1), (False, 8, 1), (True, 1, 1), (False, 3, 1), (False, 1, 2)],
+)
+def test_fp32_combine_rejects_unvalidated_layouts(monkeypatch, sp, dp, pcp):
+    runner = AscendMoERunner.__new__(AscendMoERunner)
+    runner.moe_config = SimpleNamespace(is_sequence_parallel=sp, dp_size=dp, pcp_size=pcp)
+    monkeypatch.setattr(
+        fused_moe_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A5)
+    )
+    if sp or dp not in (1, 2, 4, 8) or pcp != 1:
+        with pytest.raises(ValueError, match="non-SP, DP1/DP2/DP4/DP8 and PCP1"):
+            runner._validate_allgather_fp32_combine()
+    else:
+        runner._validate_allgather_fp32_combine()
+    monkeypatch.setattr(
+        fused_moe_module, "get_current_hardware_profile", lambda: get_hardware_profile(AscendDeviceType.A3)
+    )
+    with pytest.raises(ValueError, match="native FP32"):
+        runner._validate_allgather_fp32_combine()

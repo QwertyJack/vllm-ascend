@@ -270,3 +270,43 @@ def test_placeholder_draft_tokens_are_rejected(has_draft_logits: bool):
 
     gc.collect()
     torch.npu.empty_cache()
+
+
+@pytest.mark.parametrize("has_draft_logits", [True, False])
+@pytest.mark.parametrize("temperature", [0.7, 1.5])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@torch.inference_mode()
+def test_rejection_preserves_target_distribution(has_draft_logits, temperature, dtype):
+    """Acceptance and residual sampling must use independent random draws.
+
+    Reusing u after the rejection condition u >= p(x)/q(x) truncates its
+    distribution. With these probabilities, the old one-hot path never
+    emitted token 1 at a verified slot despite its target probability 1/4.
+    """
+    torch.manual_seed(29)
+    trials, steps = 12000, 3
+    target = torch.tensor([0.5, 0.25, 0.25]).log().to(dtype).to("npu")
+    draft = (torch.tensor([0.75, 0.125, 0.125]).log() * temperature).to(dtype).to("npu")
+    inputs = _build_rejection_sample_inputs(target, draft, steps, temperature, trials)
+    if not has_draft_logits:
+        inputs["draft_logits"] = None
+        inputs["draft_sampled"].zero_()
+    # Compute the law from the actual rounded logits, independent of kernels.
+    p = torch.softmax(target.cpu().double(), 0)
+    q = torch.softmax(draft.cpu().double() / temperature, 0)
+    alpha = torch.minimum(p, q).sum().item() if has_draft_logits else p[0].item()
+    sampled, lengths = rejection_sample(**inputs, num_speculative_steps=steps)
+    sampled, lengths = sampled.cpu(), lengths.cpu()
+    for slot in range(steps + 1):
+        values = sampled[lengths > slot, slot]
+        observed = torch.bincount(values, minlength=3).double() / len(values)
+        tolerance = 6 * torch.sqrt(p * (1 - p) / len(values)) + 0.002
+        assert ((observed - p).abs() <= tolerance).all(), (
+            f"Slot {slot}: observed {observed.tolist()}, target {p.tolist()}"
+        )
+    for slot in range(steps):
+        observed_ar = (lengths > slot + 1).double().mean().item()
+        assert abs(observed_ar - alpha ** (slot + 1)) < 0.025
+
+    gc.collect()
+    torch.npu.empty_cache()

@@ -29,6 +29,7 @@ from vllm.distributed.parallel_state import (
 from vllm.model_executor.layers.fused_moe import FusedMoEConfig
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.lora.fused_moe import prepare_lora_indices
 from vllm_ascend.ops.fused_moe.dataclass.prepare_finalize import MoEPrepareOutput
@@ -393,6 +394,8 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         Returns:
             MoEPrepareOutput with global tensors.
         """
+        self._dots3_output_dtype = hidden_states.dtype
+        self._dots3_fp32_finalize = quant_type == QuantType.W8A8MXFP and get_ascend_config().moe_allgather_fp32_combine
         if self._use_ep_sequence_parallel():
             return self._prepare_with_ep_group(hidden_states, router_logits, quant_type)
 
@@ -566,4 +569,6 @@ class PrepareAndFinalizeWithAllGather(PrepareAndFinalize):
         if self.moe_config.dp_size > 1:
             hidden_states = get_dp_group().reduce_scatter(hidden_states, 0)
             hidden_states = hidden_states[: self.num_tokens]
+            if self._dots3_fp32_finalize:
+                hidden_states = hidden_states.to(self._dots3_output_dtype)
         return hidden_states

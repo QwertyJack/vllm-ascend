@@ -1,6 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+import pytest
 import torch
 import torch.nn as nn
 from vllm.model_executor.layers.linear import RowParallelLinear
@@ -25,6 +26,9 @@ class TestAscendW8A8MXFP8LinearMethod(TestBase):
         nz_config = patch("vllm_ascend.utils.get_ascend_config", return_value=SimpleNamespace(weight_nz_mode=1))
         self.addCleanup(nz_config.stop)
         nz_config.start()
+        format_cast = patch("vllm_ascend.utils.torch_npu.npu_format_cast", side_effect=lambda tensor, *a, **k: tensor)
+        self.addCleanup(format_cast.stop)
+        format_cast.start()
 
     def test_modelopt_config_defaults_group_size(self):
         vllm_config = create_mock_vllm_config()
@@ -214,6 +218,51 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
         nz_config = patch("vllm_ascend.utils.get_ascend_config", return_value=SimpleNamespace(weight_nz_mode=1))
         self.addCleanup(nz_config.stop)
         nz_config.start()
+        format_cast = patch("vllm_ascend.utils.torch_npu.npu_format_cast", side_effect=lambda tensor, *a, **k: tensor)
+        self.addCleanup(format_cast.stop)
+        format_cast.start()
+
+    def test_swiglu_quantization_honors_fusion_and_scale_algorithm(self):
+        path = "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8"
+        for fusion, algorithm in ((False, 0), (True, 1)):
+            compute_input = SimpleNamespace(fusion=fusion)
+            with (
+                patch(f"{path}.get_dynamic_mx_quant_scale_alg", return_value=algorithm),
+                patch.object(self.scheme, "apply_gmm1", return_value="gate_up") as gmm1,
+                patch(f"{path}.torch_npu.npu_swiglu", return_value="activation", create=True) as swiglu,
+                patch.object(self.scheme, "apply_act_quant", return_value=("fp8", "scale")) as quant,
+                patch(f"{path}.torch_npu.npu_grouped_matmul_swiglu_quant_v2", create=True) as fused,
+            ):
+                result = self.scheme.apply_gmm1_act_quant(compute_input)
+            self.assertEqual(result, ("fp8", "scale"))
+            gmm1.assert_called_once_with(compute_input)
+            swiglu.assert_called_once_with("gate_up")
+            quant.assert_called_once_with(compute_input, "activation")
+            fused.assert_not_called()
+
+    def test_scale_algorithm_zero_retains_fused_swiglu(self):
+        path = "vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8"
+        data = SimpleNamespace(
+            fusion=True,
+            hidden_states=torch.zeros(2, 128),
+            dynamic_scale=None,
+            layer=SimpleNamespace(w13_weight="weight", w13_weight_scale="scale"),
+            group_list=torch.tensor([2]),
+            group_list_type=0,
+        )
+        with (
+            patch(f"{path}.get_dynamic_mx_quant_scale_alg", return_value=0),
+            patch.object(self.scheme, "_quant_hidden_states", return_value=("x", "x_scale")),
+            patch.object(self.scheme, "apply_gmm1") as separate,
+            patch(
+                f"{path}.torch_npu.npu_grouped_matmul_swiglu_quant_v2", return_value=("fp8", "scale"), create=True
+            ) as fused,
+            patch(f"{path}.dispose_tensor"),
+            patch(f"{path}.maybe_normalize_mxfp_scale_layout", side_effect=lambda x: x),
+        ):
+            self.assertEqual(self.scheme.apply_gmm1_act_quant(data), ("fp8", "scale"))
+        fused.assert_called_once()
+        separate.assert_not_called()
 
     def test_modelopt_config_defaults_group_size(self):
         vllm_config = create_mock_vllm_config()
@@ -406,3 +455,29 @@ class TestAscendW8A8MXFP8MoEMethod(TestBase):
             shared_experts_input=None,
         )
         mock_comm.fused_experts.assert_called_once()
+
+
+def test_kv_b_mxfp8_is_decoded_before_mla_absorption():
+    from vllm.model_executor.layers.quantization.utils.quant_utils import get_and_maybe_dequant_weights
+
+    from vllm_ascend.quantization.utils import dequantize_mxfp8_weight
+
+    scheme = AscendW8A8MXFP8DynamicLinearMethod.__new__(AscendW8A8MXFP8DynamicLinearMethod)
+    scheme.group_size = 32
+    scheme.model_dtype = torch.bfloat16
+    layer = nn.Module()
+    layer.prefix = "model.layers.0.self_attn.kv_b_proj"
+    layer.weight = nn.Parameter(torch.ones(4, 64).to(torch.float8_e4m3fn), requires_grad=False)
+    layer.weight_scale = nn.Parameter(torch.tensor([[127, 128]] * 4, dtype=torch.uint8), requires_grad=False)
+    expected = torch.cat([torch.ones(4, 32), torch.full((4, 32), 2.0)], 1).bfloat16()
+    with patch("vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8.maybe_trans_nz", side_effect=lambda x: x):
+        scheme.process_weights_after_loading(layer)
+    torch.testing.assert_close(layer.weight, expected)
+    assert not hasattr(layer, "weight_scale")
+    # vLLM's generic MLA packing runs after the Ascend backend packing.
+    # It must consume the decoded matrix without invoking MX GEMM again.
+    torch.testing.assert_close(get_and_maybe_dequant_weights(layer, out_dtype=torch.bfloat16), expected)
+    with pytest.raises(ValueError, match="NaN E8M0"):
+        dequantize_mxfp8_weight(torch.ones(4, 64).to(torch.float8_e4m3fn), torch.full((4, 2), 255, dtype=torch.uint8))
+    with pytest.raises(ValueError, match="shape"):
+        dequantize_mxfp8_weight(torch.ones(4, 64).to(torch.float8_e4m3fn), torch.ones(4, 1, dtype=torch.uint8))

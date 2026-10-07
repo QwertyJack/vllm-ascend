@@ -30,6 +30,113 @@ from vllm_ascend.quantization.methods.w8a8.w8a8_mxfp8 import AscendW8A8MXFP8Dyna
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_ND, ACL_FORMAT_FRACTAL_NZ
 
 
+def test_manual_mla_cache_preserves_normalization_rope_and_destination():
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.num_kv_heads, impl.kv_lora_rank, impl.qk_rope_head_dim = 1, 4, 2
+    impl.kv_lora_scale = 2.0
+    impl.kv_a_layernorm = lambda x: x + 1
+    impl.k_rope_only_layernorm = lambda x: x * 3
+    impl.rope_single = lambda x, cos, sin: x + 5
+    inputs = torch.arange(18, dtype=torch.float32).reshape(3, 6)
+    cache = (torch.empty(2, 128, 1, 4), torch.empty(2, 128, 1, 2))
+    slots = torch.tensor([127, 128, -1], dtype=torch.int64)
+    with patch("vllm_ascend.attention.mla_v1.DeviceOperator.reshape_and_cache") as write:
+        rope, latent = impl._manual_kv_norm_rope_cache(inputs, None, None, cache, slots)
+    expected_latent, expected_rope = (inputs[:, :4] + 1) * 2, inputs[:, 4:] * 3 + 5
+    torch.testing.assert_close(latent, expected_latent)
+    torch.testing.assert_close(rope, expected_rope[:, None])
+    write.assert_called_once()
+    arguments = write.call_args.kwargs
+    torch.testing.assert_close(arguments["key"], expected_latent[:, None])
+    torch.testing.assert_close(arguments["value"], expected_rope[:, None])
+    torch.testing.assert_close(arguments["slot_mapping"], slots.int())
+    assert arguments["key_cache"] is cache[0] and arguments["value_cache"] is cache[1]
+
+
+@pytest.mark.parametrize("context_length", [0, 900])
+@pytest.mark.parametrize("force_latent", [False, True])
+def test_sliding_prefill_bounds_scores_and_matches_full_causal_reference(context_length, force_latent):
+    torch.manual_seed(17)
+    length, heads, rank, nope, rope, window, block_size = 1027, 2, 4, 3, 2, 512, 128
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.num_kv_heads, impl.kv_lora_rank, impl.qk_rope_head_dim = 1, rank, rope
+    impl.sliding_window, impl.scale = window, (nope + rope) ** -0.5
+    impl.mla_force_latent_sliding_prefill = force_latent
+    impl.mla_sliding_prefill_chunk_rows = 64
+    impl.W_UK_T = torch.randn(heads, nope, rank)
+    impl._v_up_proj = lambda value: value.transpose(0, 1).reshape(length, -1)
+    q_nope, q_pe = torch.randn(length, heads, nope), torch.randn(length, heads, rope)
+    latent, k_pe = torch.randn(length, rank), torch.randn(length, rope)
+    past_latent, past_rope = torch.randn(1024, rank), torch.randn(1024, rope)
+    cache = (past_latent.reshape(-1, block_size, 1, rank), past_rope.reshape(-1, block_size, 1, rope))
+    metadata = SimpleNamespace(
+        prefill=SimpleNamespace(
+            actual_seq_lengths_q=[length], context_lens=[context_length], block_table=torch.arange(8).reshape(1, -1)
+        )
+    )
+    context_start = max(0, context_length - window)
+    key_latent = torch.cat((past_latent[context_start:context_length], latent))
+    key_rope = torch.cat((past_rope[context_start:context_length], k_pe))
+    query_latent = torch.bmm(q_nope.transpose(0, 1), impl.W_UK_T).transpose(0, 1)
+    scores = (
+        torch.einsum("thd,sd->hts", query_latent, key_latent) + torch.einsum("thd,sd->hts", q_pe, key_rope)
+    ) * impl.scale
+    query_positions = torch.arange(context_length, context_length + length)
+    key_positions = torch.arange(context_start, context_length + length)
+    allowed = (key_positions[None] <= query_positions[:, None]) & (
+        key_positions[None] >= query_positions[:, None] - window
+    )
+    expected = torch.einsum(
+        "hts,sd->thd", scores.masked_fill(~allowed[None], -float("inf")).softmax(-1), key_latent
+    ).reshape(length, -1)
+    with (
+        patch("vllm_ascend.attention.mla_v1._EXTRA_CTX", SimpleNamespace(capturing=False)),
+        patch("torch.einsum", wraps=torch.einsum) as einsum,
+        patch("torch.bmm", wraps=torch.bmm) as bmm,
+    ):
+        actual = impl._forward_prefill_unfused(q_nope, q_pe, k_pe, latent, k_pe, cache, metadata)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    if force_latent:
+        scores = [call for call in bmm.call_args_list if call.args[1].shape[-1] == window + 1]
+        assert scores and all(call.args[0].shape[0] <= 64 for call in scores)
+    else:
+        key_lengths = [call.args[2].shape[0] for call in einsum.call_args_list if call.args[0] == "thd,sd->hts"]
+        assert len(key_lengths) == 6 and max(key_lengths) <= window + 512
+
+
+@pytest.mark.parametrize("context_length", [0, 512])
+def test_padded_fia_sliding_prefill_preserves_window_and_value_width(context_length):
+    torch.manual_seed(23)
+    length, heads, rank, nope, rope, value_dim = 520, 2, 6, 4, 4, 4
+    impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.num_heads, impl.sliding_window, impl.v_head_dim = heads, 512, value_dim
+    impl.scale = (nope + rope) ** -0.5
+    impl.W_UK_T, impl.W_UV = torch.randn(heads, nope, rank), torch.randn(heads, rank, value_dim)
+    q_nope, q_pe = torch.randn(length, heads, nope), torch.randn(length, heads, rope)
+    latent, key_rope = torch.randn(context_length + length, rank), torch.randn(context_length + length, rope)
+    query = torch.cat((q_nope, q_pe), -1).transpose(0, 1)
+    key = torch.cat(
+        (torch.matmul(latent[None], impl.W_UK_T.transpose(-2, -1)), key_rope[None].expand(heads, -1, -1)), -1
+    )
+    value = torch.matmul(latent[None], impl.W_UV)
+    q_positions, k_positions = torch.arange(context_length, context_length + length), torch.arange(len(latent))
+    mask = (k_positions[None] > q_positions[:, None]) | (k_positions[None] < q_positions[:, None] - 512)
+    probability = ((query @ key.transpose(-2, -1)) * impl.scale).masked_fill(mask[None], -float("inf")).softmax(-1)
+    expected = (probability @ value).transpose(0, 1).reshape(length, -1)
+
+    def fia(q, k, v, **kwargs):
+        assert q.shape[-1] == k.shape[-1] == v.shape[-1] == nope + rope
+        assert not v[..., value_dim:].any()
+        scores = (q @ k.transpose(-2, -1)) * kwargs["scale"]
+        return scores.masked_fill(kwargs["atten_mask"], -float("inf")).softmax(-1) @ v, None
+
+    with patch("torch_npu.npu_fused_infer_attention_score", side_effect=fia) as operator:
+        actual = impl._forward_sliding_prefill_padded_fia(q_nope, q_pe, latent, key_rope, context_length)
+    torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
+    assert operator.call_count == 2
+    assert max(call.args[1].shape[-2] for call in operator.call_args_list) <= 1024
+
+
 @pytest.mark.parametrize("num_tokens", [1, 3])
 @pytest.mark.parametrize(
     "num_heads,kv_lora_rank",
@@ -387,6 +494,7 @@ def test_mla_pcp_metadata_keeps_expanded_slot_mapping() -> None:
 
 def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.has_mla_extras = False
     captured: dict[str, torch.Tensor] = {}
 
     def fake_gather(tensors, slot_mapping, num_decode_tokens):
@@ -466,6 +574,7 @@ def test_mla_pcp_prefill_gathers_padded_cache_inputs() -> None:
 
 def test_mla_pcp_nope_prefill_trims_gathered_outputs() -> None:
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.has_mla_extras = False
 
     def fake_gather(tensors, slot_mapping, num_decode_tokens):
         assert num_decode_tokens == 0
@@ -563,6 +672,8 @@ class TestPrefillMLAPreprocessResult(TestBase):
         self.assertIsNone(result.k_nope)
         self.assertIsNone(result.k_pe)
         self.assertIsNone(result.value)
+        self.assertIsNone(result.kv_lora)
+        self.assertIsNone(result.k_pe_cache)
 
     def test_prefill_mla_preprocess_result_with_values(self):
         q_nope = torch.randn(2, 4, 8)
@@ -1597,7 +1708,7 @@ class TestAscendMLAImpl(TestBase):
             "use_mla_rope": True,
         }
 
-        self.impl = AscendMLAImpl(
+        self.impl_init_kwargs = dict(
             num_heads=num_heads,
             head_size=head_size,
             scale=scale,
@@ -1611,6 +1722,7 @@ class TestAscendMLAImpl(TestBase):
             kv_sharing_target_layer_name=None,
             **kwargs,
         )
+        self.impl = AscendMLAImpl(**self.impl_init_kwargs)
         self.impl.fa_quant_layer = False
 
     def test_init(self):
@@ -1674,6 +1786,52 @@ class TestAscendMLAImpl(TestBase):
         self.assertTrue(impl.is_draft_model)
         self.assertFalse(impl.enable_mlapo)
         mock_enabling_mlapo.assert_not_called()
+
+    def test_latent_sliding_prefill_selection(self):
+        kwargs = dict(self.impl_init_kwargs)
+        kwargs.update(
+            k_rope_only_layernorm=MagicMock(),
+            kv_lora_rank=1024,
+            qk_nope_head_dim=192,
+            qk_rope_head_dim=64,
+            qk_head_dim=256,
+            sliding_window=511,
+        )
+        for force_latent, capable, sliding in (
+            (False, True, True),
+            (True, True, True),
+            (False, False, True),
+            (False, True, False),
+        ):
+            with self.subTest(force_latent=force_latent, capable=capable, sliding=sliding):
+                config = SimpleNamespace(enable_kv_nz=False, mla_force_latent_sliding_prefill=force_latent)
+                profile = MagicMock()
+                profile.supports.return_value = capable
+                kwargs["sliding_window"] = 511 if sliding else None
+                with (
+                    patch("vllm_ascend.attention.mla_v1.get_current_vllm_config", return_value=self.impl.vllm_config),
+                    patch("vllm_ascend.attention.mla_v1.get_ascend_config", return_value=config),
+                    patch("vllm_ascend.attention.mla_v1.get_current_hardware_profile", return_value=profile),
+                ):
+                    impl = AscendMLAImpl(**kwargs)
+                self.assertEqual(impl.use_padded_fia_sliding_prefill, capable and sliding and not force_latent)
+
+    def test_mla_extras_use_layer_rotary_emb(self):
+        global_layer_kwargs = dict(self.impl_init_kwargs)
+        global_layer_kwargs["k_rope_only_layernorm"] = MagicMock()
+        global_layer_kwargs["sliding_window"] = None
+        with patch(
+            "vllm_ascend.attention.mla_v1.get_current_vllm_config",
+            return_value=self.impl.vllm_config,
+        ):
+            global_layer = AscendMLAImpl(**global_layer_kwargs)
+
+            sliding_layer_kwargs = dict(global_layer_kwargs)
+            sliding_layer_kwargs["sliding_window"] = 511
+            sliding_layer = AscendMLAImpl(**sliding_layer_kwargs)
+
+        self.assertTrue(global_layer.use_layer_rotary_emb)
+        self.assertTrue(sliding_layer.use_layer_rotary_emb)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
     def test_init_head_padding_for_non_power_of_two(self, mock_get_current_vllm_config):
@@ -1796,10 +1954,10 @@ class TestAscendMLAImpl(TestBase):
     @patch("torch.npu.graph_task_update_begin")
     @patch("torch.npu.graph_task_update_end")
     @patch("torch_npu.npu_fused_infer_attention_score_v2.out")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     def test_update_graph_params(
         self,
-        mock_get_forward_context,
+        mock_extra_ctx,
         mock_fia,
         mock_update_end,
         mock_update_begin,
@@ -1848,8 +2006,7 @@ class TestAscendMLAImpl(TestBase):
         mock_get_draft_graph_params.return_value = mock_graph_params
 
         # forward context
-        mock_ctx = MagicMock()
-        mock_get_forward_context.return_value = mock_ctx
+        mock_ctx = mock_extra_ctx
 
         # speculative_config
         mock_speculative_config = MagicMock()
@@ -1865,16 +2022,14 @@ class TestAscendMLAImpl(TestBase):
             draft_attn_metadatas=[{"layer_0": mock_attn_metadata}],
         )
 
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
-    def test_update_graph_params_empty_layers(self, mock_get_forward_context):
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
+    def test_update_graph_params_empty_layers(self, mock_extra_ctx):
         # if num_layers == 0
         mock_update_stream = MagicMock()
         mock_forward_context = MagicMock()
         mock_forward_context.attn_metadata = {}
 
-        mock_ctx = MagicMock()
-        mock_ctx.is_draft_model = False
-        mock_get_forward_context.return_value = mock_ctx
+        mock_extra_ctx.is_draft_model = False
 
         AscendMLAImpl.update_graph_params(mock_update_stream, mock_forward_context, 100)
 
@@ -1883,10 +2038,10 @@ class TestAscendMLAImpl(TestBase):
     @patch("torch.npu.graph_task_update_end")
     @patch("torch.npu.graph_task_update_begin")
     @patch("torch.npu.stream")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     def test_update_graph_params_with_mtp(
         self,
-        mock_get_forward_context,
+        mock_extra_ctx,
         mock_npu_stream,
         mock_graph_task_update_begin,
         mock_graph_task_update_end,
@@ -1903,9 +2058,7 @@ class TestAscendMLAImpl(TestBase):
         mock_forward_context.attn_metadata = {"layer_0": mock_attn_metadata}
 
         # forward context
-        mock_ctx = MagicMock()
-        mock_ctx.is_draft_model = False
-        mock_get_forward_context.return_value = mock_ctx
+        mock_extra_ctx.is_draft_model = False
 
         mock_stream_context = MagicMock()
         mock_npu_stream.return_value = mock_stream_context
@@ -2647,12 +2800,10 @@ class TestAscendMLAImpl(TestBase):
         self.assertNotIn("key_rope", call_kwargs)
         self.assertEqual(out.shape, prefix_out.shape)
 
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     @patch("vllm_ascend.attention.mla_v1.AscendMLAImpl._v_up_proj")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")
-    def test_forward_decode_without_graph(
-        self, mock_npu_fused_infer_attention_score_v2, mock_up_proj, mock_get_forward_context
-    ):
+    def test_forward_decode_without_graph(self, mock_npu_fused_infer_attention_score_v2, mock_up_proj, mock_extra_ctx):
         num_tokens = 100
         block_size = 4
         q_nope = torch.randn(num_tokens, self.impl.num_heads, self.impl.qk_nope_head_dim)
@@ -2668,7 +2819,8 @@ class TestAscendMLAImpl(TestBase):
             None,
         ]
         mock_up_proj.return_value = torch.randn(num_tokens, self.impl.num_heads, self.impl.v_head_dim)
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
         result = self.impl._forward_decode(
             DecodeMLAPreprocessResult(
                 q_nope,
@@ -2927,6 +3079,20 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(k_pe.shape[-1], self.impl.qk_rope_head_dim)
         self.assertEqual(k_nope.shape[-1], self.impl.kv_lora_rank)
 
+    @patch("torch_npu.npu_kv_rmsnorm_rope_cache")
+    def test_exec_kv_decode_extras_do_not_overwrite_normalized_cache(self, fused_cache):
+        self.impl.has_mla_extras = True
+        self.impl._manual_kv_norm_rope_cache = MagicMock()
+        cache = (torch.zeros(1), torch.ones(1))
+        args = (torch.empty(1), torch.empty(1), torch.empty(1), cache, torch.tensor([0]))
+
+        rope, latent = self.impl.exec_kv_decode(*args)
+
+        self.impl._manual_kv_norm_rope_cache.assert_called_once_with(*args)
+        fused_cache.assert_not_called()
+        self.assertIs(rope, cache[1])
+        self.assertIs(latent, cache[0])
+
     @patch("vllm_ascend.attention.mla_v1.torch_npu.npu_kv_rmsnorm_rope_cache", create=True)
     def test_exec_kv_decode(self, mock_kv_rmsnorm_rope_cache):
         B = 2
@@ -2953,9 +3119,9 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(k_pe.shape[-1], self.impl.qk_rope_head_dim)
         self.assertEqual(k_nope.shape[-1], self.impl.kv_lora_rank)
 
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")
-    def test_forward_decode(self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context):
+    def test_forward_decode(self, mock_npu_fused_infer_attention_score_v2, mock_extra_ctx):
         B = 2
         N = self.impl.num_kv_heads
         BS = 100
@@ -2976,7 +3142,8 @@ class TestAscendMLAImpl(TestBase):
         self.impl.enable_kv_nz = True
 
         mock_npu_fused_infer_attention_score_v2.return_value = [torch.randn(B, N, self.impl.kv_lora_rank), None]
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
         result = self.impl._forward_decode(
             DecodeMLAPreprocessResult(
                 q_nope,
@@ -2993,10 +3160,10 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(result.shape[2], HD)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")
     def test_forward_decode_non_power_of_two_heads(
-        self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context, mock_get_current_vllm_config
+        self, mock_npu_fused_infer_attention_score_v2, mock_extra_ctx, mock_get_current_vllm_config
     ):
         """Test decode with non-power-of-2 heads pads to next power of 2 and slices output."""
         mock_get_current_vllm_config.return_value = MagicMock()
@@ -3058,7 +3225,8 @@ class TestAscendMLAImpl(TestBase):
             torch.randn(impl.num_heads_padded, B, impl.kv_lora_rank),
             None,
         ]
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
         result = impl._forward_decode(
             DecodeMLAPreprocessResult(
                 q_nope,
@@ -3080,10 +3248,10 @@ class TestAscendMLAImpl(TestBase):
         self.assertEqual(call_kwargs.get("num_query_heads"), impl.num_heads_padded)
 
     @patch("vllm_ascend.attention.mla_v1.get_current_vllm_config")
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")
     def test_forward_decode_non_power_of_two_heads_normal(
-        self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context, mock_get_current_vllm_config
+        self, mock_npu_fused_infer_attention_score_v2, mock_extra_ctx, mock_get_current_vllm_config
     ):
         """Test normal decode (BNSD_NBSD) with non-power-of-2 heads pads q and slices output."""
         mock_get_current_vllm_config.return_value = MagicMock()
@@ -3146,7 +3314,8 @@ class TestAscendMLAImpl(TestBase):
             torch.randn(impl.num_heads_padded, B, 1, impl.kv_lora_rank),
             None,
         ]
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
         result = impl._forward_decode(
             DecodeMLAPreprocessResult(
                 q_nope,
@@ -3166,9 +3335,9 @@ class TestAscendMLAImpl(TestBase):
         call_kwargs = mock_npu_fused_infer_attention_score_v2.call_args.kwargs
         self.assertEqual(call_kwargs.get("num_query_heads"), impl.num_heads_padded)
 
-    @patch("vllm_ascend.ascend_forward_context.get_forward_context")
+    @patch("vllm_ascend.attention.mla_v1._EXTRA_CTX")
     @patch("torch_npu.npu_fused_infer_attention_score_v2")
-    def test_forward_decode_with_fa_quant(self, mock_npu_fused_infer_attention_score_v2, mock_get_forward_context):
+    def test_forward_decode_with_fa_quant(self, mock_npu_fused_infer_attention_score_v2, mock_extra_ctx):
         # test fa_quant_layer is True
         B = 2
         N = self.impl.num_heads  # use num_heads instead of num_kv_heads
@@ -3197,7 +3366,8 @@ class TestAscendMLAImpl(TestBase):
             torch.randn(B, self.impl.num_kv_heads, self.impl.kv_lora_rank),
             None,
         ]
-        mock_get_forward_context.return_value = MagicMock(capturing=False)
+        mock_extra_ctx.capturing = False
+        mock_extra_ctx.is_draft_model = False
         dequant_scale_q_nope = torch.randn(B, N)  # shape is [B, num_heads]
         result = self.impl._forward_decode(
             DecodeMLAPreprocessResult(
@@ -3222,6 +3392,7 @@ class TestAscendMLAImpl(TestBase):
 def test_mla_nope_decode_preserves_current_kv_contract():
     """DCP needs current KV tensors in addition to the paged NoPE cache."""
     impl = AscendMLAImpl.__new__(AscendMLAImpl)
+    impl.has_mla_extras = False
     impl.use_mla_rope = True
     impl.num_kv_heads = 1
     impl.kv_lora_rank = 4

@@ -6,6 +6,7 @@ import scipy.linalg  # type: ignore
 import torch
 import torch_npu
 from torch import nn
+from torch.nn import functional as F
 from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.distributed import get_tp_group
 from vllm.triton_utils import HAS_TRITON
@@ -177,6 +178,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         self.q_lora_rank: int = vllm_indexer.q_lora_rank  # 1536
         self.wq_b = vllm_indexer.wq_b
         self.wk_weights_proj = vllm_indexer.wk_weights_proj
+        self.fixed_projection_rows = getattr(get_ascend_config(), "dsa_indexer_fixed_rows", 0)
         self.k_norm = vllm_indexer.k_norm
         self.softmax_scale = vllm_indexer.softmax_scale
         self.k_cache: Any = getattr(vllm_indexer, "k_cache", None)
@@ -199,8 +201,11 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             elif self.c8_k_cache_dtype == torch.int8:
                 self.c8_k_scale_cache_dtype = torch.float16
 
-        model_type = get_current_vllm_config().model_config.hf_config.model_type
-        self.is_rope_neox_style = model_type not in ["glm_moe_dsa"]
+        model_config = get_current_vllm_config().model_config
+        model_type = model_config.hf_config.model_type
+        self.is_rope_neox_style = not getattr(
+            model_config.hf_text_config, "indexer_rope_interleave", model_type == "glm_moe_dsa"
+        )
         self.use_torch_npu_lightning_indexer = model_type in ["glm_moe_dsa"]
 
         # Cache-write gathers for parallel layouts: PCP all-gathers the
@@ -294,6 +299,18 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         """Whether this indexer can use the LI C8 cache-write operator."""
         return self.enable_sparse_li_c8 and get_ascend_config().c8_reshape_optim_enabled
 
+    def _project_key_and_weights(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        assert self.wk_weights_proj is not None
+        fixed_rows = getattr(self, "fixed_projection_rows", 0)
+        if not fixed_rows or not hidden_states.shape[0]:
+            return self.wk_weights_proj(hidden_states)[0]
+        outputs = []
+        for chunk in hidden_states.split(fixed_rows):
+            padded = F.pad(chunk, (0, 0, 0, fixed_rows - chunk.shape[0]))
+            output, _ = self.wk_weights_proj(padded)
+            outputs.append(output[: chunk.shape[0]])
+        return torch.cat(outputs, dim=0)
+
     def forward_k(
         self,
         hidden_states: torch.Tensor,
@@ -312,31 +329,13 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         assert self.wk_weights_proj is not None
         assert self.k_norm is not None
 
-        kw, _ = self.wk_weights_proj(hidden_states)
+        kw = self._project_key_and_weights(hidden_states)
         k_li = kw[:, : self.head_dim]
         indexer_weights = kw[:, self.head_dim :]
         k_li = self.k_norm(k_li).unsqueeze(1)
         k_li = k_li.view(-1, 1, self.head_dim)
 
-        if HAS_TRITON:
-            cos = cos.view(-1, self.qk_rope_head_dim)
-            sin = sin.view(-1, self.qk_rope_head_dim)
-            k_li = rope_forward_triton_siso(
-                k_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
-        else:
-            k_li_pe, k_li_nope = torch.split(
-                k_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )
-
-            cos = cos.view(-1, 1, 1, self.qk_rope_head_dim)
-            sin = sin.view(-1, 1, 1, self.qk_rope_head_dim)
-
-            k_li_pe = k_li_pe.unsqueeze(2)
-            k_li_pe = torch_npu.npu_rotary_mul(k_li_pe, cos, sin)
-            k_li_pe = k_li_pe.squeeze(2)
-
-            k_li = torch.cat([k_li_pe, k_li_nope], dim=-1)  # [b*s,128]
+        k_li = self._apply_rope(k_li, cos, sin)
 
         if self.enable_sparse_li_c8:
             assert self.k_hadamard is not None
@@ -348,6 +347,28 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             k_li_scale = None
 
         return k_li, k_li_scale, indexer_weights
+
+    def _apply_rope(self, value: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        if HAS_TRITON:
+            return rope_forward_triton_siso(
+                value,
+                cos.view(-1, self.qk_rope_head_dim),
+                sin.view(-1, self.qk_rope_head_dim),
+                rope_dim=self.qk_rope_head_dim,
+                is_neox_style=self.is_rope_neox_style,
+            )
+        rope, nope = value.split([self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1)
+        if not self.is_rope_neox_style:
+            # npu_rotary_mul consumes separate real/imaginary halves.
+            rope = rope.unflatten(-1, (-1, 2)).transpose(-1, -2).flatten(-2)
+        rope = torch_npu.npu_rotary_mul(
+            rope.unsqueeze(2),
+            cos.view(-1, 1, 1, self.qk_rope_head_dim),
+            sin.view(-1, 1, 1, self.qk_rope_head_dim),
+        ).squeeze(2)
+        if not self.is_rope_neox_style:
+            rope = rope.unflatten(-1, (2, -1)).transpose(-1, -2).flatten(-2)
+        return torch.cat((rope, nope), dim=-1)
 
     def _gather_cache_inputs(
         self,
@@ -431,7 +452,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             # instead of duplicating the GEMM.
             weights = indexer_weights
         else:
-            kw, _ = self.wk_weights_proj(hidden_states)
+            kw = self._project_key_and_weights(hidden_states)
             weights = kw[:, self.head_dim :]
 
         if isinstance(q_c, tuple):
@@ -461,19 +482,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
         else:
             q_li, _ = self.wq_b(q_c)
         q_li = q_li.view(-1, self.n_head, self.head_dim)
-        if HAS_TRITON:
-            q_li = rope_forward_triton_siso(
-                q_li, cos, sin, rope_dim=self.qk_rope_head_dim, is_neox_style=self.is_rope_neox_style
-            )
-        else:
-            q_li_pe, q_li_nope = torch.split(
-                q_li, [self.qk_rope_head_dim, self.head_dim - self.qk_rope_head_dim], dim=-1
-            )
-
-            q_li_pe = q_li_pe.unsqueeze(2)
-            q_li_pe = torch_npu.npu_rotary_mul(q_li_pe, cos, sin)
-            q_li_pe = q_li_pe.squeeze(2)
-            q_li = torch.cat([q_li_pe, q_li_nope], dim=-1)
+        q_li = self._apply_rope(q_li, cos, sin)
 
         q_li_scale = None
         q_li_shape_ori = None

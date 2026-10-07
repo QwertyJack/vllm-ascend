@@ -50,6 +50,7 @@ class MoEAllGatherCombineMetadata:
     topk_weights: torch.Tensor
     expanded_row_idx: torch.Tensor
     restore_shape: torch.Size
+    fp32_combine: bool = False
 
 
 @dataclass(frozen=True, slots=True)

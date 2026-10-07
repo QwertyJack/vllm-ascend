@@ -121,8 +121,11 @@ def _probabilistic_rejection_kernel(
                     # NPU Triton lacks scalar tl.rand, so reuse the 1-element
                     # block + reduction pattern from the non-greedy path below.
                     u_pos = tl.load(pos_ptr + logit_idx).to(tl.int32)
-                    u_seed = tl.randint(seed, u_pos)
-                    u = tl.max(tl.rand(u_seed, tl.arange(0, 1)).to(tl.float32), axis=0)
+                    # Match upstream tl_rand32(seed, pos), with a vector
+                    # offset because Ascend does not support scalar tl.rand.
+                    # Resampling uses tl.rand(tl.randint(seed, pos), 0);
+                    # sharing that draw would bias it conditional on rejection.
+                    u = tl.max(tl.rand(seed, u_pos + tl.arange(0, 1)).to(tl.float32), axis=0)
                     u = tl.maximum(u, 4.6566127342e-10)
                     rate = tl.load(synthetic_conditional_rates_ptr + i)
                     accepted &= u < rate
@@ -162,8 +165,9 @@ def _probabilistic_rejection_kernel(
                 # uint64 umulhi is not supported by the Ascend vector core.
                 # Position values fit in int32 in practice.
                 u_pos = tl.load(pos_ptr + logit_idx).to(tl.int32)
-                u_seed = tl.randint(seed, u_pos)
-                u = tl.max(tl.rand(u_seed, tl.arange(0, 1)).to(tl.float32), axis=0)
+                # Keep acceptance noise separate from categorical resampling,
+                # matching upstream tl_rand32(seed, pos).
+                u = tl.max(tl.rand(seed, u_pos + tl.arange(0, 1)).to(tl.float32), axis=0)
                 u = tl.maximum(u, 4.6566127342e-10)
                 if HAS_DRAFT_LOGITS:
                     draft_logit = tl.load(

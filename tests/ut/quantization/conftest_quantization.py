@@ -93,6 +93,8 @@ def create_mock_vllm_config(
     mock_config.quant_config = Mock(quant_description=quant_description)
     mock_config.model_config = Mock(
         dtype=model_dtype,
+        architectures=(),
+        hf_text_config=Mock(model_type=None),
         hf_config=Mock(model_type=None),
         enforce_eager=enforce_eager,
     )

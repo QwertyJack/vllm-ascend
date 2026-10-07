@@ -50,3 +50,17 @@ def test_sliding_window_mla_storage_and_page_size():
     )
     assert spec.storage_block_size == 16
     assert spec.real_page_size_bytes == 16 * 128 * 2
+
+
+def test_sliding_mla_merge_preserves_speculative_retention_and_page_layout():
+    spec = AscendSlidingWindowMLASpec(
+        block_size=128,
+        num_kv_heads=1,
+        head_size=1088,
+        dtype=torch.bfloat16,
+        sliding_window=512,
+        extra_retained_tokens=3,
+        page_size_padded=128 * 1088 * 2,
+        indexes_kv_by_block_stride=True,
+    )
+    assert AscendSlidingWindowMLASpec.merge([spec, spec]) == spec

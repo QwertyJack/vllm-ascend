@@ -128,7 +128,7 @@ def _routed_output_is_reduced(layer_name: str) -> bool:
         MoECommType.MC2,
         MoECommType.ALLTOALL,
         MoECommType.FUSED_MC2,
-    } or (comm == MoECommType.ALLGATHER and is_sequence_parallel)
+    } or (comm == MoECommType.ALLGATHER and (is_sequence_parallel or getattr(runner, "allgather_fp32_combine", False)))
 
 
 def _maybe_all_reduce_tensor_model_parallel_impl(

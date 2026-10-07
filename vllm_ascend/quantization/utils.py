@@ -37,6 +37,23 @@ QUANT_DTYPES = (torch_npu.float4_e2m1fn_x2, torch_npu.hifloat8)
 SCALE_DTYPES = (torch_npu.float8_e8m0fnu,)
 
 
+def dequantize_mxfp8_weight(
+    weight: torch.Tensor, scale: torch.Tensor, group_size: int = 32, dtype: torch.dtype = torch.bfloat16
+) -> torch.Tensor:
+    """Decode checkpoint [N,K] FP8 weights and [N,ceil(K/group)] E8M0 scales."""
+    if weight.ndim != 2 or weight.dtype != torch.float8_e4m3fn:
+        raise ValueError("MXFP8 absorption requires an E4M3FN matrix in checkpoint layout.")
+    expected_shape = (weight.shape[0], (weight.shape[1] + group_size - 1) // group_size)
+    if scale.shape != expected_shape or scale.dtype not in (torch.uint8, torch.float8_e8m0fnu):
+        raise ValueError(f"MXFP8 scales must be E8M0 with shape {expected_shape}, got {scale.dtype} {scale.shape}.")
+    exponent = scale.view(torch.uint8).to(torch.int32)
+    # E8M0 byte 0 is 2**-127; byte 255 is reserved for NaN.
+    if torch.any(exponent == 255):
+        raise ValueError("MXFP8 checkpoint contains a NaN E8M0 scale.")
+    decoded = torch.exp2((exponent - 127).float())
+    return (weight.float() * decoded.repeat_interleave(group_size, dim=1)[:, : weight.shape[1]]).to(dtype)
+
+
 def is_fused_moe_layer(layer: torch.nn.Module) -> bool:
     from vllm.model_executor.layers.fused_moe import MoERunner, RoutedExperts
 
@@ -72,10 +89,9 @@ def get_dynamic_mx_quant_scale_alg(vllm_config=None) -> int:
         architectures = (architectures,)
     hf_text_config = getattr(model_config, "hf_text_config", None)
     model_type = getattr(hf_text_config, "model_type", None)
-    if (
-        any(isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures)
-        or model_type == "minimax_m3"
-    ):
+    if any(
+        isinstance(architecture, str) and architecture.startswith("MiniMaxM3") for architecture in architectures
+    ) or model_type in ("minimax_m3", "dots3_note"):
         return 1
     return 0
 

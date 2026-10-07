@@ -273,16 +273,15 @@ class AscendSlidingWindowMLASpec(SlidingWindowMLASpec):
             "quantization method, compress ratio, model version and sliding "
             "window size."
         )
-        return cls(
-            block_size=specs[0].block_size,
-            num_kv_heads=specs[0].num_kv_heads,
-            head_size=specs[0].head_size,
-            dtype=specs[0].dtype,
-            page_size_padded=specs[0].page_size_padded,
-            sliding_window=sliding_window_set.pop(),
-            cache_dtype_str=cache_dtype_str_set.pop(),
+        layouts = {(spec.alignment, spec.indexes_kv_by_block_stride) for spec in specs}
+        assert len(layouts) == 1, "Sliding MLA layers in one group must use the same physical layout."
+        # The upstream merge preserves tokens_per_state, quantization mode
+        # and speculative trailing retention, and checks the base dimensions.
+        return replace(
+            super().merge(specs),
             compress_ratio=compress_ratio_set.pop(),
-            model_version=model_version_set.pop(),
+            alignment=specs[0].alignment,
+            indexes_kv_by_block_stride=specs[0].indexes_kv_by_block_stride,
         )
 
 

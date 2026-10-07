@@ -20,7 +20,7 @@
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import replace
+from dataclasses import fields, replace
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -42,6 +42,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowMLASpec,
     SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
@@ -69,7 +70,6 @@ from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_
 from vllm_ascend.models.deepseek_v41.cache_config import is_deepseek_v41_cache
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import (
-    calc_split_factor,
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
     get_kv_cache_tensor_layers,
@@ -199,7 +199,10 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             mamba_specs[layer_name] = spec
             continue
 
-        if isinstance(attn_module, MLAAttention):
+        if isinstance(attn_module, MLAAttention) and isinstance(spec, SlidingWindowMLASpec):
+            # Preserve the sliding manager and per-layer cache dimensions.
+            spec = AscendSlidingWindowMLASpec(**{field.name: getattr(spec, field.name) for field in fields(spec)})
+        elif isinstance(attn_module, MLAAttention):
             cache_sparse_sfa_c8 = False
             if getattr(attn_module.impl, "fa_quant_layer", False):
                 head_size = attn_module.head_size + attn_module.qk_rope_head_dim
@@ -222,18 +225,20 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 or getattr(attn_module, "indexes_kv_by_block_stride", False)
             )
             compression_ratio = get_kv_cache_compression_ratio(spec)
-            ratio_kwargs: dict[str, Any] = {"tokens_per_state": compression_ratio}
-            spec = AscendMLAAttentionSpec(
-                block_size=spec.block_size,
-                num_kv_heads=spec.num_kv_heads,
+            spec_kwargs = {
+                field.name: getattr(spec, field.name) for field in fields(MLAAttentionSpec) if hasattr(spec, field.name)
+            }
+            spec_kwargs.update(
                 head_size=head_size,
                 dtype=dtype,
                 cache_dtype_str=cache_dtype_str,
-                cache_sparse_sfa_c8=cache_sparse_sfa_c8,
-                non_causal_multi_token_decode=spec.non_causal_multi_token_decode,
                 model_version=model_version,
+                tokens_per_state=compression_ratio,
+            )
+            spec = AscendMLAAttentionSpec(
+                **spec_kwargs,
+                cache_sparse_sfa_c8=cache_sparse_sfa_c8,
                 indexes_kv_by_block_stride=indexes_kv_by_block_stride,
-                **ratio_kwargs,
             )
         if isinstance(attn_module, DeepseekV32IndexerCache):
             if not getattr(
@@ -513,7 +518,7 @@ def _get_attention_kv_cache_dims(
     layer_name: str,
     kv_cache_spec: AttentionSpec,
 ) -> tuple[int, int]:
-    if isinstance(kv_cache_spec, AscendMLAAttentionSpec):
+    if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, AscendSlidingWindowMLASpec)):
         attn_layers = get_layers_from_vllm_config(get_current_vllm_config(), AttentionLayerBase, [layer_name])
         attn_layer = attn_layers[layer_name]
         if not isinstance(attn_layer, MLAAttention):
@@ -957,10 +962,10 @@ def _allocate_kv_cache(
                 k_factor, v_factor = vllm_config.quant_config.get_kv_quant_split_factor(
                     example_layer_name, [k_dim, v_dim]
                 )
+                v_size = int(kv_cache_tensor_size // v_factor)
             else:
-                k_factor, v_factor = calc_split_factor([k_dim, v_dim])
-            k_size = int(kv_cache_tensor_size // k_factor)
-            v_size = int(kv_cache_tensor_size // v_factor)
+                v_size = kv_cache_tensor_size * v_dim // (k_dim + v_dim)
+            k_size = kv_cache_tensor_size - v_size
             for layer_name in shared_names:
                 k_tensor = _allocate_int8_cache_tensor(k_size, alignment, device)
                 v_tensor = _allocate_int8_cache_tensor(v_size, alignment, device)
@@ -1318,7 +1323,7 @@ def _reshape_kv_cache_v2(
                 cache = torch.as_strided(typed_slot, size=shape, stride=tuple(strides))
                 kv_caches[layer_name] = (cache,)
                 continue
-            if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec)):
+            if isinstance(kv_cache_spec, (AscendMLAAttentionSpec, MLAAttentionSpec, AscendSlidingWindowMLASpec)):
                 num_blocks_, block_size_, num_kv_heads, _ = kv_cache_shape
                 k_dim, v_dim = _get_attention_kv_cache_dims(layer_name, kv_cache_spec)
                 k_shape = (num_blocks_, block_size_, num_kv_heads, k_dim)
@@ -1352,6 +1357,13 @@ def _reshape_kv_cache_v2(
                 kv_caches[layer_name] = (k_cache,)
             elif isinstance(raw_cache, tuple):
                 raw_k_tensor, raw_v_tensor = raw_cache
+                if kv_cache_spec.page_size_padded is not None:
+                    # Separate contiguous K/V allocations own their padding;
+                    # kernel block IDs address only the unpadded payload.
+                    k_size = torch.empty(k_shape, device="meta").numel() * get_dtype_size(k_dtype)
+                    v_size = torch.empty(v_shape, device="meta").numel() * get_dtype_size(v_dtype)
+                    raw_k_tensor = raw_k_tensor[:k_size]
+                    raw_v_tensor = raw_v_tensor[:v_size]
                 k_cache = raw_k_tensor.view(k_dtype).view(k_shape)
                 v_cache = raw_v_tensor.view(v_dtype).view(v_shape)
                 kv_caches[layer_name] = (k_cache, v_cache)

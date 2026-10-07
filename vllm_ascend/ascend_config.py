@@ -23,7 +23,7 @@ import os
 from statistics import NormalDist
 from typing import TYPE_CHECKING, Any, ClassVar, Literal
 
-from pydantic import ConfigDict, TypeAdapter, field_validator, model_validator
+from pydantic import ConfigDict, Field, TypeAdapter, field_validator, model_validator
 from pydantic_core import ArgsKwargs
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv
@@ -576,10 +576,23 @@ class AscendConfig:
     enable_pcp_embedding_lmhead_weight_sharding: bool = True
     draft_window_size: int | None = None
     mix_placement: bool = False
-    # When non-zero, force the MC2 combine stage's comm quant_mode to this
-    # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
-    # model's quant_type, 0 means disabled (use the model's own quant).
-    combine_quant_mode: Literal[0, 2, 3, 4] = 0
+    # None selects the model's automatic communication mode. Explicit 0
+    # disables combine communication quantization without changing weights
+    # or dispatch quantization; 2/3/4 force the corresponding operator mode.
+    combine_quant_mode: Literal[0, 2, 3, 4] | None = None
+    # Opt-in MXFP8 AllGather FP32 weighting/reduction with separate shared reduction.
+    moe_allgather_fp32_combine: bool = False
+    # Keep one dispatch/combine path across token counts (accuracy opt-in).
+    moe_force_allgather: bool = False
+    # Pad/chunk internal FP32 gate GEMMs to a fixed M; zero preserves auto.
+    moe_router_fixed_rows: int = Field(default=0, strict=True, ge=0)
+    # Stabilize the fused indexer wk/head-weight projection across batch shapes.
+    dsa_indexer_fixed_rows: int = Field(default=0, strict=True, ge=0)
+    # Use fixed per-query latent SWA windows to reduce cache/recompute rounding differences.
+    mla_force_latent_sliding_prefill: bool = False
+    # Number of queries processed per fixed-window latent SWA chunk. Larger
+    # values reduce NPU launches at the cost of temporary latent KV memory.
+    mla_sliding_prefill_chunk_rows: int = Field(default=256, strict=True, ge=1, le=256)
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
     # Per-rank token capacity after dispatch in the fused MC2/MegaMoe path.
     # The same value is passed as dispatch_ffn_combine's max_output_size
@@ -645,6 +658,8 @@ class AscendConfig:
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
+        if self.moe_force_allgather and self.enable_fused_mc2:
+            raise ValueError("moe_force_allgather cannot be combined with enable_fused_mc2")
         if self.weight_nz_mode not in (0, 1, 2):
             raise ValueError(f"weight_nz_mode must be one of 0, 1, or 2; got {self.weight_nz_mode}")
         # TODO(zzzzwwjj): remove it after deprecating `enable_mc2_hierarchy_comm`.
@@ -670,6 +685,10 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.moe_force_allgather and vc.lora_config is not None:
+            raise ValueError("moe_force_allgather does not support LoRA")
+        if self.dsa_indexer_fixed_rows and vc.lora_config is not None:
+            raise ValueError("dsa_indexer_fixed_rows does not support LoRA")
         if (
             self.enable_force_eplb
             and self.eplb_config.dynamic_eplb

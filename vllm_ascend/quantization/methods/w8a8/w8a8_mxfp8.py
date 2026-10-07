@@ -31,7 +31,8 @@ from vllm_ascend.ops.fused_moe.dataclass.fused_experts import MoEWeights, build_
 from vllm_ascend.ops.fused_moe.dataclass.moe_mlp import MoEMlpComputeInput
 from vllm_ascend.ops.fused_moe.moe_utils import cumsum_group_list, maybe_normalize_mxfp_scale_layout
 from vllm_ascend.ops.fused_moe.routed_experts import AscendRoutedExperts  # noqa: F401
-from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
+from vllm_ascend.ops.linear import AscendUnquantizedLinearMethod
+from vllm_ascend.quantization.utils import dequantize_mxfp8_weight, get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import FP8_METHOD, dispose_tensor, maybe_trans_nz, maybe_trans_nz_with_scale
 
 from ..base import (
@@ -71,6 +72,7 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         self.dynamic_mx_quant_scale_alg = get_dynamic_mx_quant_scale_alg(vllm_config)
 
     def get_weight(self, input_size: int, output_size: int, params_dtype: torch.dtype) -> dict[str, Any]:
+        self.model_dtype = params_dtype
         params_dict = {"weight": torch.empty(output_size, input_size, dtype=torch.float8_e4m3fn)}
         return params_dict
 
@@ -145,6 +147,21 @@ class AscendW8A8MXFP8DynamicLinearMethod(AscendLinearScheme):
         (re)loaded original-shape data in place into the cached buffer so its
         data_ptr never changes across RL weight reloads.
         """
+
+        if getattr(layer, "prefix", "").endswith("kv_b_proj"):
+            # MLA consumes the decoded matrix once to build W_UK/W_UV;
+            # its checkpoint remains FP8, while the absorbed matrices are BF16.
+            if layer.weight.dtype == torch.float8_e4m3fn:
+                resolved = dequantize_mxfp8_weight(
+                    layer.weight.data, layer.weight_scale.data, self.group_size, self.model_dtype
+                )
+                layer.weight = torch.nn.Parameter(maybe_trans_nz(resolved), requires_grad=False)
+                del layer.weight_scale
+                # Upstream MLA also inspects this layer after backend packing.
+                # Tell it the runtime weight is dense, so it does not try a
+                # quantized identity GEMM using the consumed MX scales.
+                layer.quant_method = AscendUnquantizedLinearMethod()
+            return
 
         # Check if already transformed to avoid double transformation
         if getattr(layer, "_mxfp8_transformed", False):
@@ -494,6 +511,14 @@ class AscendW8A8MXFP8DynamicFusedMoEMethod(AscendMoEScheme):
         layer._mxfp8_transformed = False
 
     def apply_gmm1_act_quant(self, mlp_compute_input: MoEMlpComputeInput):
+        if not mlp_compute_input.fusion or get_dynamic_mx_quant_scale_alg() == 1:
+            # The fused CANN kernel does not expose scale_alg and may choose
+            # a scale that clips FP8 activations. Use the explicit path when
+            # the model requests the overflow-avoiding algorithm.
+            hidden_states = self.apply_gmm1(mlp_compute_input)
+            hidden_states = torch_npu.npu_swiglu(hidden_states)
+            return self.apply_act_quant(mlp_compute_input, hidden_states)
+
         hidden_states = mlp_compute_input.hidden_states
         hidden_states, pertoken_scale = self._quant_hidden_states(hidden_states, mlp_compute_input.dynamic_scale)
         layer = mlp_compute_input.layer

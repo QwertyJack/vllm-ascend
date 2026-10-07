@@ -1943,18 +1943,96 @@ class TestTopLevelSwitchTypeValidation(TestBase):
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
-    def test_combine_quant_mode_defaults_zero(self, mock_fix):
+    def test_combine_quant_mode_defaults_auto(self, mock_fix):
         vc = VllmConfig()
-        self.assertEqual(init_ascend_config(vc).combine_quant_mode, 0)
+        config = init_ascend_config(vc)
+        self.assertIsNone(config.combine_quant_mode)
+        self.assertFalse(config.moe_allgather_fp32_combine)
+        self.assertFalse(config.moe_force_allgather)
+        self.assertEqual(config.moe_router_fixed_rows, 0)
+        self.assertEqual(config.dsa_indexer_fixed_rows, 0)
+        self.assertFalse(config.mla_force_latent_sliding_prefill)
+        self.assertEqual(config.mla_sliding_prefill_chunk_rows, 256)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_mla_force_latent_sliding_prefill(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"mla_force_latent_sliding_prefill": True}
+        self.assertTrue(init_ascend_config(vc).mla_force_latent_sliding_prefill)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_mla_sliding_prefill_chunk_rows(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"mla_sliding_prefill_chunk_rows": 128}
+        self.assertEqual(init_ascend_config(vc).mla_sliding_prefill_chunk_rows, 128)
+        for invalid in (0, 257, True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                vc.additional_config = {"refresh": True, "mla_sliding_prefill_chunk_rows": invalid}
+                init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_moe_router_fixed_rows_validation(self, mock_fix):
+        for value in (0, 16, 512):
+            vc = VllmConfig()
+            vc.additional_config = {"moe_router_fixed_rows": value, "moe_force_allgather": True}
+            config = init_ascend_config(vc)
+            self.assertEqual(config.moe_router_fixed_rows, value)
+            self.assertTrue(config.moe_force_allgather)
+        for value in (-1, True, 3.5, "512", None):
+            vc = VllmConfig()
+            vc.additional_config = {"moe_router_fixed_rows": value}
+            with self.assertRaises(ValueError):
+                init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_dsa_indexer_fixed_rows_validation(self, mock_fix):
+        for value in (0, 16, 512, -1, True, 3.5, "512", None):
+            vc = VllmConfig()
+            vc.additional_config = {"dsa_indexer_fixed_rows": value}
+            if type(value) is int and value >= 0:
+                self.assertEqual(init_ascend_config(vc).dsa_indexer_fixed_rows, value)
+            else:
+                with self.assertRaises(ValueError):
+                    init_ascend_config(vc)
+        vc = VllmConfig()
+        vc.additional_config = {"dsa_indexer_fixed_rows": 512}
+        vc.lora_config = SimpleNamespace()
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_moe_force_allgather_conflicts(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"moe_force_allgather": True, "enable_fused_mc2": 1}
+        with self.assertRaisesRegex(ValueError, "enable_fused_mc2"):
+            init_ascend_config(vc)
+        vc.additional_config = {"moe_force_allgather": True}
+        vc.lora_config = SimpleNamespace()
+        with self.assertRaisesRegex(ValueError, "LoRA"):
+            init_ascend_config(vc)
+
+    @_clean_up
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_moe_allgather_fp32_combine_explicit_opt_in(self, mock_fix):
+        vc = VllmConfig()
+        vc.additional_config = {"moe_allgather_fp32_combine": True, "combine_quant_mode": 0}
+        config = init_ascend_config(vc)
+        self.assertTrue(config.moe_allgather_fp32_combine)
+        self.assertEqual(config.combine_quant_mode, 0)
 
     @_clean_up
     @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
     def test_combine_quant_mode_accepts_whitelisted_int(self, mock_fix):
-        # combine_quant_mode is a Literal[0, 2, 3, 4], so only the whitelisted
+        # combine_quant_mode is an optional Literal[0, 2, 3, 4], so only the whitelisted
         # integer values are accepted. Unlike the plain-int top-level switches
         # (e.g. weight_nz_mode), int strings ("4") are rejected rather than
         # lax-coerced, so the orthogonal test below covers that.
-        for value in (0, 2, 4):
+        for value in (None, 0, 2, 3, 4):
             with self.subTest(value=value):
                 vc = VllmConfig()
                 vc.additional_config = {"combine_quant_mode": value}

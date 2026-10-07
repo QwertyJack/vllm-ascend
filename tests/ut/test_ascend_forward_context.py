@@ -87,6 +87,7 @@ def _patch_select_moe_comm_method_deps(
     ep_world_size: int = 8,
     enable_fused_mc2: int = 0,
     is_moe: bool = True,
+    force_allgather: bool = False,
 ):
     monkeypatch.setattr(afc, "is_moe_model", lambda _: is_moe)
     monkeypatch.setattr(afc, "get_mc2_tokens_capacity", lambda: capacity)
@@ -95,7 +96,7 @@ def _patch_select_moe_comm_method_deps(
     monkeypatch.setattr(
         afc,
         "get_ascend_config",
-        lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2),
+        lambda: SimpleNamespace(enable_fused_mc2=enable_fused_mc2, moe_force_allgather=force_allgather),
     )
 
 
@@ -243,6 +244,12 @@ def test_is_decode_only_node_false_without_recompute_scheduler(monkeypatch):
     )
 
     assert afc._is_decode_only_node(vllm_config) is False
+
+
+@pytest.mark.parametrize("num_tokens", [1, 16, 512])
+def test_select_moe_comm_method_force_allgather(monkeypatch, num_tokens):
+    _patch_select_moe_comm_method_deps(monkeypatch, device_type=AscendDeviceType.A5, force_allgather=True)
+    assert afc.select_moe_comm_method(num_tokens, _make_vllm_config()) == MoECommType.ALLGATHER
 
 
 def test_select_moe_comm_method_returns_none_for_non_moe(monkeypatch):

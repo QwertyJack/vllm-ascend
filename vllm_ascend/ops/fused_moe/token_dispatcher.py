@@ -26,7 +26,8 @@ from typing import Generic
 import torch
 import torch_npu
 from vllm.config import get_current_vllm_config
-from vllm.distributed.parallel_state import get_ep_group
+from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import get_mc2_tokens_capacity
@@ -50,6 +51,7 @@ from vllm_ascend.ops.fused_moe.dataclass.token_dispatcher import (
 )
 from vllm_ascend.ops.fused_moe.moe_utils import async_all_to_all, gather_from_sequence_parallel_region
 from vllm_ascend.quantization.quant_type import QuantType
+from vllm_ascend.quantization.utils import get_dynamic_mx_quant_scale_alg
 from vllm_ascend.utils import should_skip_allreduce_across_dp_group
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
@@ -273,11 +275,11 @@ class TokenDispatcherWithMC2(MoETokenDispatcher[MoEMC2CombineMetadata]):
 
         assert expert_map is not None
         # NOTE: quant_mode differs by quant features:
-        # - additional_config.combine_quant_mode, when non-zero, forces quant_mode
-        #   to that value regardless of quant_type
+        # - an explicit additional_config.combine_quant_mode forces quant_mode,
+        #   including 0 to disable communication quantization
         # - A5 MXFP communication uses quant_mode=4 only for W8A8MXFP currently.
         combine_quant_mode = get_ascend_config().combine_quant_mode
-        if combine_quant_mode:
+        if combine_quant_mode is not None:
             quant_mode = combine_quant_mode
         elif comm_quant_mode is not None:
             quant_mode = comm_quant_mode
@@ -337,6 +339,7 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.max_num_tokens = kwargs.get("max_num_tokens")
+        self.fp32_combine = kwargs.get("fp32_combine", False)
         num_experts_local = kwargs.get("num_local_experts", 0)
         self.num_experts_local = (
             num_experts_local.item() if torch.is_tensor(num_experts_local) else int(num_experts_local)
@@ -389,6 +392,19 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             _, topk = topk_weights.shape
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+        if (
+            with_quant
+            and dynamic_scale is None
+            and quant_type == QuantType.W8A8MXFP
+            and get_dynamic_mx_quant_scale_alg() == 1
+        ):
+            # Init-routing's fused MX quantization has no scale_alg argument.
+            # Quantize explicitly so algorithm 1 avoids FP8 saturation, then
+            # route both the FP8 rows and their E8M0 scales without requantizing.
+            hidden_states, dynamic_scale = torch_npu.npu_dynamic_mx_quant(
+                hidden_states, dst_type=act_quant_type or torch.float8_e4m3fn, scale_alg=1
+            )
+            quant_mode = -1
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
             mask = expert_map[topk_ids] != -1
@@ -423,15 +439,26 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
                 topk_weights=topk_weights,
                 expanded_row_idx=expanded_row_idx,
                 restore_shape=restore_shape,
+                fp32_combine=self.fp32_combine and quant_type == QuantType.W8A8MXFP,
             ),
         )
 
     def token_combine(self, hidden_states, combine_metadata, bias=None):
+        output_dtype = hidden_states.dtype
+        if combine_metadata.fp32_combine:
+            # Keep FP32 router weights and accumulate all expert contributions
+            # before the single output cast. The runner reduces shared output
+            # separately and skips a second reduction of the combined result.
+            hidden_states = hidden_states.float()
         final_hidden_states = DeviceOperator.npu_moe_token_unpermute(
             permuted_tokens=hidden_states,
             sorted_indices=combine_metadata.expanded_row_idx,
             probs=combine_metadata.topk_weights.to(hidden_states.dtype),
         )
+        if combine_metadata.fp32_combine:
+            final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
+            if get_dp_group().world_size == 1:
+                final_hidden_states = final_hidden_states.to(output_dtype)
         if len(combine_metadata.restore_shape) == 3:
             final_hidden_states = final_hidden_states.view(combine_metadata.restore_shape)
 

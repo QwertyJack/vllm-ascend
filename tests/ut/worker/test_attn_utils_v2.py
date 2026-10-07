@@ -1251,3 +1251,71 @@ def test_mrv2_binding_wraps_only_v41_slots():
     kv_view, scale_view = v41_indexer.kv_cache[0]
     assert kv_view is kv_caches["model.layers.2.self_attn.indexer.k_cache"][0]
     assert scale_view is kv_caches["model.layers.2.self_attn.indexer.k_cache"][1]
+
+
+@pytest.mark.parametrize("padded", [False, True])
+def test_dots3_mixed_mla_cache_preserves_sliding_specs_and_layer_dims(monkeypatch, padded):
+    """SWA must keep its manager and 1024/64 split through allocation and binding."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, SlidingWindowMLASpec
+
+    from vllm_ascend.attention.mla_v1 import AscendMLABackend
+    from vllm_ascend.core.kv_cache_interface import AscendSlidingWindowMLASpec
+
+    layers = {}
+    for name, rank, spec_cls in [("full", 512, MLAAttentionSpec), ("swa", 1024, SlidingWindowMLASpec)]:
+        layer = _make_mla_layer()
+        layer.head_size = rank + 64
+        layer.kv_lora_rank = rank
+        kwargs = {"sliding_window": 512, "extra_retained_tokens": 3} if name == "swa" else {}
+        spec = spec_cls(
+            block_size=128,
+            num_kv_heads=1,
+            head_size=rank + 64,
+            dtype=torch.bfloat16,
+            page_size_padded=128 * 1088 * 2 if padded else None,
+            **kwargs,
+        )
+        layer.get_kv_cache_spec = lambda _cfg, spec=spec: spec
+        layer.get_attn_backend = lambda: AscendMLABackend
+        layer.num_heads = 8
+        layers[name] = layer
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=1),
+        cache_config=SimpleNamespace(block_size=128, cache_dtype="auto"),
+        attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
+        model_config=SimpleNamespace(
+            dtype=torch.bfloat16, hf_config=SimpleNamespace(), hf_text_config=SimpleNamespace()
+        ),
+        kv_transfer_config=None,
+        quant_config=None,
+        additional_config={},
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "get_layers_from_vllm_config", lambda *_a, **_k: layers)
+    monkeypatch.setattr(attn_utils, "enable_sfa_dcp_replicated_indexer", lambda *_a: False)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda *_a: False)
+    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda *_a: False)
+    specs = attn_utils.get_kv_cache_spec(config)
+    assert isinstance(specs["full"], AscendMLAAttentionSpec)
+    assert isinstance(specs["swa"], AscendSlidingWindowMLASpec)
+    assert specs["swa"].sliding_window == 512
+    assert specs["swa"].extra_retained_tokens == 3
+    cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=[name], kv_cache_spec=spec) for name, spec in specs.items()],
+        kv_cache_tensors=[
+            _make_kv_cache_tensor(2 * spec.page_size_bytes, [name], spec.page_size_bytes)
+            for name, spec in specs.items()
+        ],
+    )
+    caches = attn_utils.allocate_kv_cache_main(cache_config, torch.device("cpu"), None, [128, 128])
+    for name, rank in [("full", 512), ("swa", 1024)]:
+        latent, rope = caches[name]
+        assert latent.shape == (2, 128, 1, rank)
+        assert rope.shape == (2, 128, 1, 64)
+        latent[0].fill_(1)
+        latent[1].fill_(2)
+        rope[0].fill_(3)
+        rope[1].fill_(4)
+        assert torch.all(latent[0] == 1) and torch.all(latent[1] == 2)
+        assert torch.all(rope[0] == 3) and torch.all(rope[1] == 4)

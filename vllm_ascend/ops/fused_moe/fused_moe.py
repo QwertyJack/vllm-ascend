@@ -29,7 +29,9 @@ from vllm.model_executor.layers.fused_moe.layer import MoERunner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import _moe_forward_shared, _unpack
 from vllm.utils.torch_utils import direct_register_custom_op
 
+from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX, MoECommType
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 from vllm_ascend.distributed.parallel_state import get_mc2_group
 from vllm_ascend.ops.fused_moe.dataclass.shared_experts import PreparedSharedExpertInput, RoutedMoEMilestones
 from vllm_ascend.ops.fused_moe.moe_comm_method import get_moe_comm_method, setup_moe_comm_method
@@ -38,6 +40,7 @@ from vllm_ascend.ops.fused_moe.shared_experts import (
     AscendSharedExperts,
     SharedExpertParallelMode,
 )
+from vllm_ascend.quantization.quant_type import QuantType
 
 
 def _ascend_moe_forward_shared_sp_fake(
@@ -111,6 +114,11 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         self.hidden_size = moe_config.hidden_dim
 
         self.quant_type = routed_experts.quant_type
+        self.allgather_fp32_combine = (
+            self.quant_type == QuantType.W8A8MXFP and get_ascend_config().moe_allgather_fp32_combine is True
+        )
+        if self.allgather_fp32_combine:
+            self._validate_allgather_fp32_combine()
         self.routed_experts.router = router
 
         self.moe_config.tp_group = get_tp_group()
@@ -123,6 +131,7 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         # Use ctor `gate` (not self.is_internal_router): Module.__getattr__ shadows during init.
         if gate is not None and not hasattr(gate, "weight_fp32"):
             gate.precast_fp32_weight = True
+        self.router_fixed_rows = getattr(get_ascend_config(), "moe_router_fixed_rows", 0)
 
         self.ascend_shared_experts = None
         if shared_experts is not None:
@@ -283,7 +292,20 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
             MoECommType.ALLTOALL,
             MoECommType.MC2,
             MoECommType.FUSED_MC2,
-        } or (moe_comm_type == MoECommType.ALLGATHER and self.moe_config.is_sequence_parallel)
+        } or (
+            moe_comm_type == MoECommType.ALLGATHER
+            and (self.moe_config.is_sequence_parallel or getattr(self, "allgather_fp32_combine", False))
+        )
+
+    def _validate_allgather_fp32_combine(self) -> None:
+        if not get_current_hardware_profile().supports(HardwareCapability.MOE_UNPERMUTE_FP32):
+            raise ValueError("moe_allgather_fp32_combine requires native FP32 MoE token-unpermute support")
+        if (
+            self.moe_config.is_sequence_parallel
+            or self.moe_config.dp_size not in (1, 2, 4, 8)
+            or self.moe_config.pcp_size != 1
+        ):
+            raise ValueError("moe_allgather_fp32_combine candidate requires non-SP, DP1/DP2/DP4/DP8 and PCP1")
 
     def _get_shared_expert_parallel_mode(self) -> SharedExpertParallelMode:
         shared_experts = getattr(self, "ascend_shared_experts", None)
@@ -398,14 +420,31 @@ class AscendMoERunner(MoERunner):  # type: ignore[no-redef]
         """
         gate = self.gate
         assert gate is not None
+        fixed_rows = getattr(self, "router_fixed_rows", 0)
         if not hasattr(gate, "weight_fp32"):
+            if fixed_rows:
+                raise ValueError("moe_router_fixed_rows requires a pre-cast FP32 gate weight")
             gate_out = gate(hidden_states)
-            return gate_out[0] if isinstance(gate_out, tuple) else gate_out
+            output = gate_out[0] if isinstance(gate_out, tuple) else gate_out
 
         # AscendUnquantizedLinearMethod normally pre-casts the weight so the
         # hot path only needs to materialize the FP32 activation when required.
-        router_input = router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
-        return F.linear(router_input, gate.weight_fp32)
+        else:
+            router_input = router_logits if router_logits.dtype == torch.float32 else hidden_states.float()
+            if fixed_rows and router_input.shape[0]:
+                outputs = []
+                for chunk in router_input.split(fixed_rows):
+                    padded = F.pad(chunk, (0, 0, 0, fixed_rows - chunk.shape[0]))
+                    outputs.append(F.linear(padded, gate.weight_fp32)[: chunk.shape[0]])
+                output = torch.cat(outputs, dim=0)
+            else:
+                output = F.linear(router_input, gate.weight_fp32)
+
+        rounding_dtype = getattr(gate, "router_logit_rounding_dtype", None)
+        if rounding_dtype is not None:
+            # Activation and route weights remain FP32 after logit rounding.
+            output = output.to(rounding_dtype).float()
+        return output
 
     def _prepare_router_and_milestones(
         self,

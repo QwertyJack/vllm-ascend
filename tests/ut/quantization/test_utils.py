@@ -34,10 +34,12 @@ class TestDynamicMxQuantScaleAlg(TestBase):
     @patch("vllm_ascend.quantization.utils.get_current_hardware_profile")
     def test_uses_one_only_for_minimax_m3_on_a5(self, mock_profile):
         minimax_config = self._config("MiniMaxM3SparseForCausalLM")
+        dots3_config = self._config(None, model_type="dots3_note")
         other_config = self._config("DeepseekV3ForCausalLM")
 
         mock_profile.return_value = get_hardware_profile(AscendDeviceType.A5)
         self.assertEqual(get_dynamic_mx_quant_scale_alg(minimax_config), 1)
+        self.assertEqual(get_dynamic_mx_quant_scale_alg(dots3_config), 1)
         self.assertEqual(get_dynamic_mx_quant_scale_alg(other_config), 0)
 
         mock_profile.return_value = get_hardware_profile(AscendDeviceType.A3)
