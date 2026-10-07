@@ -265,9 +265,7 @@ class AscendSFAIndexerBackend(nn.Module, AttentionBackend):
             # Reinterpret both sides, never numerically cast quantized keys.
             torch.ops._C_ascend.store_kv_block(
                 k_li.view(torch.int8) if k_li.dtype == torch.float8_e4m3fn else k_li,
-                indexer_k_cache.view(torch.int8)
-                if indexer_k_cache.dtype == torch.float8_e4m3fn
-                else indexer_k_cache,
+                indexer_k_cache.view(torch.int8) if indexer_k_cache.dtype == torch.float8_e4m3fn else indexer_k_cache,
                 indexer_attn_metadata.group_len,
                 indexer_attn_metadata.group_key_idx,
                 indexer_attn_metadata.group_key_cache_idx,

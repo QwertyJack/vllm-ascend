@@ -30,9 +30,12 @@ def test_store_kv_fp8_keys_and_fp32_scales_use_byte_exact_views(store):
         _use_c8_reshape_optim=lambda: True,
         enable_sparse_li_c8=True,
     )
-    metadata = SimpleNamespace(group_len=torch.tensor([3], dtype=torch.int32),
-                               group_key_idx=torch.tensor([0], dtype=torch.int32),
-                               group_key_cache_idx=torch.tensor([0], dtype=torch.int32), block_size=4)
+    metadata = SimpleNamespace(
+        group_len=torch.tensor([3], dtype=torch.int32),
+        group_key_idx=torch.tensor([0], dtype=torch.int32),
+        group_key_cache_idx=torch.tensor([0], dtype=torch.int32),
+        block_size=4,
+    )
     AscendSFAIndexerBackend.write_cache(indexer, key, scale, torch.arange(3), metadata)
     assert store.call_count == 2
     key_view, key_cache_view = store.call_args_list[0].args[:2]
